@@ -19,6 +19,16 @@ type Queue struct {
 	deps Deps
 	ch   chan queueItem
 	wg   sync.WaitGroup
+
+	// pauseMu/pausedUntil/pauseReason — общая пауза всей очереди на случай
+	// исчерпанного лимита использования claude (см. review.ErrUsageLimit).
+	// Пока pausedUntil в будущем, processTask/resumeTask пропускают задачи,
+	// не трогая ClickUp и не создавая запись в store — сверка (тикер
+	// ReconcileInterval) сама повторит попытку, когда пауза закончится,
+	// без отдельного таймера здесь.
+	pauseMu     sync.Mutex
+	pausedUntil time.Time
+	pauseReason string
 }
 
 // New создаёт очередь с заданным размером буфера.
@@ -58,6 +68,32 @@ func (q *Queue) SubmitResume(taskID string) bool {
 			"task_id", taskID)
 		return false
 	}
+}
+
+// pauseFor ставит всю очередь на паузу минимум до now+d: новые вызовы
+// processTask/resumeTask до этого момента становятся no-op. Повторный вызов
+// с меньшей длительностью паузу не сокращает — например, если /spec и
+// /review одной и той же задачи оба упёрлись в лимит, действует более
+// поздний срок.
+func (q *Queue) pauseFor(d time.Duration, reason string) {
+	q.pauseMu.Lock()
+	defer q.pauseMu.Unlock()
+	if until := time.Now().Add(d); until.After(q.pausedUntil) {
+		q.pausedUntil = until
+		q.pauseReason = reason
+	}
+}
+
+// pausedFor возвращает, стоит ли очередь на паузе прямо сейчас, и на сколько
+// ещё, — для лога при пропуске задачи.
+func (q *Queue) pausedFor() (bool, time.Duration, string) {
+	q.pauseMu.Lock()
+	defer q.pauseMu.Unlock()
+	remaining := time.Until(q.pausedUntil)
+	if remaining <= 0 {
+		return false, 0, ""
+	}
+	return true, remaining, q.pauseReason
 }
 
 // Start запускает workers воркеров, разбирающих канал.

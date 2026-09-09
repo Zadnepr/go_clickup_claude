@@ -3,6 +3,7 @@ package review
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -119,6 +120,46 @@ func TestRunner_RunReview_ClaudeReportsError(t *testing.T) {
 	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
 	if err == nil {
 		t.Fatal("expected error when claude reports is_error=true")
+	}
+}
+
+func TestRunner_RunReview_UsageLimitReached(t *testing.T) {
+	out := claudeJSONResult{
+		Type:      "result",
+		Subtype:   "error_during_execution",
+		IsError:   true,
+		Result:    "Claude AI usage limit reached. Your limit will reset in 3 hours.",
+		SessionID: "sess-limit",
+	}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
+
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
+	if err == nil {
+		t.Fatal("expected error when usage limit is reached")
+	}
+	if !errors.Is(err, ErrUsageLimit) {
+		t.Errorf("expected errors.Is(err, ErrUsageLimit), got: %v", err)
+	}
+}
+
+func TestRunner_RunSpec_UsageLimitReached(t *testing.T) {
+	out := claudeJSONResult{
+		Type:    "result",
+		Subtype: "error_during_execution",
+		IsError: true,
+		Result:  "rate limit exceeded, please retry later",
+	}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
+
+	_, _, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123")
+	if !errors.Is(err, ErrUsageLimit) {
+		t.Errorf("expected errors.Is(err, ErrUsageLimit), got: %v", err)
 	}
 }
 
@@ -242,7 +283,7 @@ func TestGitFetch_AllRepositoriesFail(t *testing.T) {
 func TestRunner_SpecFilePath(t *testing.T) {
 	r := &Runner{RepoPath: "/repo"}
 	got := r.SpecFilePath("42")
-	want := filepath.Join("/repo", ".claude", "specs", "42.md")
+	want := filepath.Join("/repo", "specs", "42.md")
 	if got != want {
 		t.Errorf("SpecFilePath = %q, want %q", got, want)
 	}

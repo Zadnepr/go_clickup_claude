@@ -2,12 +2,14 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Zadnepr/go_clickup_claude/internal/clickup"
 	"github.com/Zadnepr/go_clickup_claude/internal/config"
@@ -72,7 +74,7 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 }
 
 // specFileCandidateIDs возвращает ID, по которым /spec могла сохранить файл
-// ТЗ, в порядке приоритета. /spec называет файл `.claude/specs/<ID задачи>.md`,
+// ТЗ, в порядке приоритета. /spec называет файл `specs/<ID задачи>.md`,
 // и на практике команда предпочитает человекочитаемый custom_id (например,
 // "PNL-4528"), если он у задачи задан — иначе использует нативный ID ClickUp.
 // Проверяем оба варианта, чтобы не промахнуться мимо реально созданного файла.
@@ -106,6 +108,11 @@ func (q *Queue) processTask(taskID string) {
 	defer cancel()
 
 	log := q.deps.Logger.With("task_id", taskID)
+
+	if paused, remaining, reason := q.pausedFor(); paused {
+		log.Debug("queue is paused, skipping until the pause ends", "remaining", remaining.Round(time.Second), "reason", reason)
+		return
+	}
 
 	task, err := q.deps.ClickUp.GetTask(ctx, taskID)
 	if err != nil {
@@ -143,6 +150,13 @@ func (q *Queue) resumeTask(taskID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ReviewTimeout)
 	defer cancel()
 
+	// Пауза очереди (см. runReview) здесь намеренно не проверяется:
+	// SubmitResume вызывается один раз при старте для задач, которые
+	// зависли конкретно в этом виде (см. Store.RecoverFromRestart) и не
+	// обязательно эффективны для сверки (карточка может не соответствовать
+	// условию триггера) — пропустить эту попытку значит рискнуть потерять
+	// задачу до ручного вмешательства. Один лишний запуск на паузу не
+	// критичен: он тут же попадёт в ту же ветку обработки ErrUsageLimit.
 	log := q.deps.Logger.With("task_id", taskID, "resumed", true)
 
 	task, err := q.deps.ClickUp.GetTask(ctx, taskID)
@@ -210,6 +224,10 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	specSessionID, specUsage, err := q.deps.Runner.RunSpec(ctx, task.URL)
+	if errors.Is(err, review.ErrUsageLimit) {
+		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, specSessionID, err, specUsage)
+		return
+	}
 	if err != nil {
 		log.Warn("/spec run failed, falling back to a single task link for /review",
 			"error", err.Error(), "spec_session_id", specSessionID)
@@ -218,7 +236,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	specPath := ""
 	for _, id := range specFileCandidateIDs(task) {
 		if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(id)); statErr == nil {
-			specPath = filepath.Join(".claude", "specs", id+".md")
+			specPath = filepath.Join("specs", id+".md")
 			break
 		}
 	}
@@ -228,6 +246,10 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 
 	result, reviewErr := q.deps.Runner.RunReview(ctx, task.URL, specPath)
 	totalUsage := specUsage.Add(result.Usage)
+	if errors.Is(reviewErr, review.ErrUsageLimit) {
+		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, result.SessionID, reviewErr, totalUsage)
+		return
+	}
 	verdict := result.Verdict
 	if reviewErr != nil {
 		log.Error("/review run failed", "error", reviewErr.Error(), "stderr", truncateForLog(result.Stderr))
@@ -287,6 +309,43 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 
 	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, result.SessionID, storeUsage(totalUsage)); err != nil {
 		log.Error("failed to mark run done", "error", err.Error())
+	}
+}
+
+// pauseAndRestore обрабатывает review.ErrUsageLimit: исчерпанный лимит
+// использования claude — это не результат ревью и не сбой процесса, а
+// временное состояние аккаунта. В отличие от обычной ошибки (см. комментарий
+// перед reviewErr == nil в runReview), карточку возвращаем в исходный вид —
+// статус триггера и снятых исполнителей — чтобы сверка подобрала задачу
+// заново сама, без ручного вмешательства, когда лимит освободится.
+func (q *Queue) pauseAndRestore(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64, originalAssignees []int, sessionID string, causeErr error, usage review.TokenUsage) {
+	cfg := q.deps.Cfg
+	errMsg := causeErr.Error()
+
+	if cfg.StatusTrigger != "" {
+		if err := q.deps.ClickUp.SetStatus(ctx, task.ID, cfg.StatusTrigger); err != nil {
+			log.Error("failed to move task back to trigger status after usage limit pause",
+				"attempted_status", cfg.StatusTrigger, "error", err.Error())
+		}
+	}
+	if len(originalAssignees) > 0 {
+		if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, originalAssignees); err != nil {
+			log.Error("failed to restore assignees after usage limit pause", "assignees", originalAssignees, "error", err.Error())
+		}
+	}
+
+	if err := q.deps.Store.MarkPaused(ctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
+		log.Error("failed to mark run paused", "error", err.Error())
+	}
+
+	q.pauseFor(cfg.UsageLimitPause, errMsg)
+
+	log.Warn("claude usage limit reached, pausing queue and returning task to trigger state",
+		"pause_for", cfg.UsageLimitPause, "error", errMsg)
+
+	text, blocks := slack.BuildPausedMessage(task.Name, task.URL, cfg.UsageLimitPause, errMsg)
+	if err := q.deps.Slack.Send(ctx, text, blocks); err != nil {
+		log.Error("failed to send slack paused notification", "error", err.Error())
 	}
 }
 

@@ -1,6 +1,9 @@
 package slack
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // ReviewNotification — данные одного законченного прогона ревью, нужные
 // для формирования Slack-сообщения. Собирается вызывающей стороной из
@@ -102,6 +105,24 @@ func BuildServiceErrorMessage(taskName, taskURL, errText string) (text string, b
 	blocks = []Block{
 		Header("🔥 Внутренняя ошибка сервиса ревью"),
 		Section(fmt.Sprintf("*Задача:* <%s|%s>\n*Ошибка:* %s", taskURL, taskName, errText)),
+	}
+	return text, blocks
+}
+
+// BuildPausedMessage формирует сообщение о том, что проверка задачи
+// поставлена на паузу из-за исчерпанного лимита использования claude — это
+// не ошибка и не результат ревью, задача вернётся в очередь автоматически.
+func BuildPausedMessage(taskName, taskURL string, pauseFor time.Duration, reason string) (text string, blocks []Block) {
+	text = fmt.Sprintf("⏸️ Проверка на паузе (исчерпан лимит claude): %s — %s", taskName, taskURL)
+
+	lines := fmt.Sprintf(
+		"*Задача:* <%s|%s>\n*Причина:* %s\n*Повтор:* автоматически через сверку, не раньше чем через %s",
+		taskURL, taskName, reason, pauseFor.Round(time.Second),
+	)
+
+	blocks = []Block{
+		Header("⏸️ Ревью на паузе — исчерпан лимит claude"),
+		Section(lines),
 	}
 	return text, blocks
 }

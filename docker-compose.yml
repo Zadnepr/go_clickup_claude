@@ -32,6 +32,7 @@ services:
       - WORKER_CONCURRENCY
       - REVIEW_TIMEOUT
       - RECONCILE_INTERVAL
+      - USAGE_LIMIT_PAUSE
       - PORT
       - DB_PATH
       # SSH-агент хоста форвардится в контейнер (см. volumes ниже) — git
@@ -68,7 +69,6 @@ services:
       # содержит сохранённую сессию/токен — тот же принцип, что и SSH-агент:
       # используются реальные креды хоста, ничего не копируется в образ.
       - ../cli/notion-private-api-mcp:/opt/notion-cli:ro
-      - ../.claude/specs:/home/node/.claude/specs
       - ~/.config/notion-cli:/home/node/.config/notion-cli:ro
       - ~/.cache/notion-cli:/home/node/.cache/notion-cli
 

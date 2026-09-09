@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,7 @@ type fakeRunner struct {
 	reviewErr       error
 	gitErr          error
 	gotSpecPath     string // specPath, с которым реально вызвали RunReview
+	reviewCalled    bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
 }
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
@@ -92,6 +94,7 @@ func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, revie
 }
 
 func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error) {
+	f.reviewCalled = true
 	f.gotSpecPath = specPath
 	return f.result, f.reviewErr
 }
@@ -181,6 +184,7 @@ func testConfig(t *testing.T) *config.Config {
 		AssigneeOnFail:    "20",
 		WorkerConcurrency: 1,
 		ReviewTimeout:     10 * time.Second,
+		UsageLimitPause:   time.Minute,
 		RepoPath:          repoWithCommands(t),
 	}
 }
@@ -287,6 +291,112 @@ func TestProcessTask_ReviewProcessError_MarksRunFailedAndNotifies(t *testing.T) 
 		t.Fatal("expected task to be re-enqueueable after a failed run")
 	}
 	_ = runID
+}
+
+func TestProcessTask_UsageLimitFromReview_PausesQueueAndRestoresState(t *testing.T) {
+	task := &clickup.Task{
+		ID: "4", Name: "Task 4", URL: "https://app.clickup.com/t/4",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check", Assignees: []int{7},
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		reviewErr: fmt.Errorf("/review run failed: %w: usage limit reached", review.ErrUsageLimit),
+	}
+
+	cfg := testConfig(t)
+	deps, _, calls := newTestDeps(t, cu, runner, cfg)
+	q := New(deps, 10)
+	q.processTask("4")
+
+	// Карточка должна вернуться в исходное состояние: статус — обратно на
+	// триггерный, снятый на время проверки исполнитель — восстановлен.
+	// Иначе задача застрянет в running-колонке до ручного вмешательства,
+	// хотя лимит освободится сам.
+	cu.mu.Lock()
+	if len(cu.statuses) != 2 || cu.statuses[0] != cfg.StatusRunning || cu.statuses[1] != cfg.StatusTrigger {
+		t.Errorf("expected running then back to trigger status, got: %+v", cu.statuses)
+	}
+	if len(cu.assignees) != 1 || len(cu.assignees[0]) != 1 || cu.assignees[0][0] != 7 {
+		t.Errorf("expected original assignee [7] restored, got: %+v", cu.assignees)
+	}
+	if len(cu.removedTags) != 0 {
+		t.Errorf("trigger tag must stay on a usage-limit pause, got: %+v", cu.removedTags)
+	}
+	cu.mu.Unlock()
+
+	if paused, remaining, _ := q.pausedFor(); !paused || remaining <= 0 {
+		t.Errorf("expected queue to be paused, paused=%v remaining=%v", paused, remaining)
+	}
+
+	// Failed/paused-прогон не блокирует повторную постановку — сверка
+	// подберёт задачу снова, когда пауза очереди закончится.
+	if _, enqueued, err := deps.Store.TryEnqueue(context.Background(), "4"); err != nil || !enqueued {
+		t.Fatalf("expected task to be re-enqueueable after a usage-limit pause: enqueued=%v err=%v", enqueued, err)
+	}
+
+	foundPausedNotice := false
+	for _, c := range *calls {
+		if strings.Contains(c.Text, "паузе") {
+			foundPausedNotice = true
+		}
+	}
+	if !foundPausedNotice {
+		t.Errorf("expected a slack notification about the pause, got: %+v", *calls)
+	}
+}
+
+func TestProcessTask_UsageLimitFromSpec_SkipsReviewAndPauses(t *testing.T) {
+	task := &clickup.Task{
+		ID: "5", Name: "Task 5", URL: "https://app.clickup.com/t/5",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specErr: fmt.Errorf("/spec run failed: %w: usage limit reached", review.ErrUsageLimit),
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("5")
+
+	if runner.reviewCalled {
+		t.Error("expected /review not to run when /spec already hit the usage limit")
+	}
+	if paused, _, _ := q.pausedFor(); !paused {
+		t.Error("expected queue to be paused after /spec usage-limit error")
+	}
+}
+
+func TestProcessTask_SkippedWhilePaused(t *testing.T) {
+	task := &clickup.Task{
+		ID: "6", Name: "Task 6", URL: "https://app.clickup.com/t/6",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		result: review.Result{Verdict: review.Verdict{Status: review.StatusPass}},
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.pauseFor(time.Minute, "test pause")
+
+	q.processTask("6")
+
+	cu.mu.Lock()
+	if len(cu.statuses) != 0 {
+		t.Errorf("expected no ClickUp interaction while paused, got statuses: %+v", cu.statuses)
+	}
+	cu.mu.Unlock()
+	if len(*calls) != 0 {
+		t.Errorf("expected no slack notifications while paused, got: %+v", *calls)
+	}
+
+	// Пропуск не должен создавать dedup-запись — иначе после окончания паузы
+	// сверка не сможет поставить задачу в очередь заново.
+	if _, enqueued, err := deps.Store.TryEnqueue(context.Background(), "6"); err != nil || !enqueued {
+		t.Fatalf("expected task to remain enqueueable while paused: enqueued=%v err=%v", enqueued, err)
+	}
 }
 
 func TestProcessTask_NotEligible_SkipsWithoutDedupRecord(t *testing.T) {
@@ -460,7 +570,7 @@ func TestProcessTask_UsesCustomIDForSpecFileWhenPresent(t *testing.T) {
 	q := New(deps, 10)
 	q.processTask("10")
 
-	want := filepath.Join(".claude", "specs", "PNL-4528.md")
+	want := filepath.Join("specs", "PNL-4528.md")
 	if runner.gotSpecPath != want {
 		t.Errorf("specPath passed to RunReview = %q, want %q", runner.gotSpecPath, want)
 	}

@@ -18,6 +18,11 @@ const (
 	StatusRunning = "running"
 	StatusDone    = "done"
 	StatusFailed  = "failed"
+	// StatusPaused — прогон остановлен из-за исчерпанного лимита Claude
+	// (usage limit/rate limit), не из-за реальной ошибки. Как и failed, не
+	// блокирует повторную постановку задачи в очередь (см. TryEnqueue) —
+	// когда лимит освободится, сверка подберёт задачу заново.
+	StatusPaused = "paused"
 )
 
 // Run — одна запись таблицы runs.
@@ -209,6 +214,22 @@ func (s *Store) MarkFailed(ctx context.Context, runID int64, sessionID, errMsg s
 	`, StatusFailed, sessionID, errMsg, time.Now().UTC(), usage.InputTokens, usage.OutputTokens, usage.CostUSD, runID)
 	if err != nil {
 		return fmt.Errorf("mark run %d failed: %w", runID, err)
+	}
+	return nil
+}
+
+// MarkPaused переводит прогон в статус paused: claude сообщил об исчерпанном
+// лимите использования, это не результат ревью и не сбой — сервис сам
+// поставит проверку на паузу и повторит её позже (см. Queue.pauseFor).
+func (s *Store) MarkPaused(ctx context.Context, runID int64, sessionID, errMsg string, usage Usage) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE runs
+		SET status = ?, session_id = ?, error = ?, finished_at = ?,
+		    input_tokens = ?, output_tokens = ?, cost_usd = ?
+		WHERE id = ?
+	`, StatusPaused, sessionID, errMsg, time.Now().UTC(), usage.InputTokens, usage.OutputTokens, usage.CostUSD, runID)
+	if err != nil {
+		return fmt.Errorf("mark run %d paused: %w", runID, err)
 	}
 	return nil
 }

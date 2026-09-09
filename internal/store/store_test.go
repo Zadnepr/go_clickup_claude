@@ -96,6 +96,43 @@ func TestTryEnqueue_ReopensAfterFailed(t *testing.T) {
 	}
 }
 
+func TestTryEnqueue_ReopensAfterPaused(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, ok, err := s.TryEnqueue(ctx, "task-usage-limit")
+	if err != nil || !ok {
+		t.Fatalf("initial enqueue failed: ok=%v err=%v", ok, err)
+	}
+	if err := s.MarkRunning(ctx, id); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	if err := s.MarkPaused(ctx, id, "session-1", "usage limit reached", Usage{}); err != nil {
+		t.Fatalf("MarkPaused error: %v", err)
+	}
+
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != StatusPaused {
+		t.Errorf("Status = %q, want %q", run.Status, StatusPaused)
+	}
+
+	// Paused, как и failed, не должен блокировать повторную постановку —
+	// сверка подберёт задачу снова, когда лимит освободится.
+	newID, ok, err := s.TryEnqueue(ctx, "task-usage-limit")
+	if err != nil {
+		t.Fatalf("TryEnqueue after paused error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected enqueue to succeed after previous run was paused")
+	}
+	if newID == id {
+		t.Fatal("expected a new run id, not reuse of the paused one")
+	}
+}
+
 func TestRecoverFromRestart(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

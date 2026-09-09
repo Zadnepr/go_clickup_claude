@@ -29,6 +29,7 @@ type Config struct {
 	WorkerConcurrency    int
 	ReviewTimeout        time.Duration
 	ReconcileInterval    time.Duration
+	UsageLimitPause      time.Duration
 	Port                 int
 	DBPath               string
 	Home                 string
@@ -77,6 +78,12 @@ func Load(getenv func(string) string) (*Config, error) {
 	cfg.Port = parseIntDefault(getenv("PORT"), 8080, "PORT", &problems)
 	cfg.ReviewTimeout = parseDurationDefault(getenv("REVIEW_TIMEOUT"), 15*time.Minute, "REVIEW_TIMEOUT", &problems)
 	cfg.ReconcileInterval = parseDurationDefault(getenv("RECONCILE_INTERVAL"), 5*time.Minute, "RECONCILE_INTERVAL", &problems)
+	// Пауза после исчерпания лимита Claude (Требование: не проваливать
+	// проверку, а ждать обновления лимитов). Сверка (ReconcileInterval) —
+	// естественный "будильник" для повторной попытки, поэтому по умолчанию
+	// пауза дольше него: иначе сверка снова наткнётся на тот же лимит через
+	// считанные минуты.
+	cfg.UsageLimitPause = parseDurationDefault(getenv("USAGE_LIMIT_PAUSE"), 30*time.Minute, "USAGE_LIMIT_PAUSE", &problems)
 
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("некорректная конфигурация:\n  - %s", strings.Join(problems, "\n  - "))

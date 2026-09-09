@@ -44,6 +44,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.ReconcileInterval != 5*time.Minute {
 		t.Errorf("ReconcileInterval = %v, want 5m", cfg.ReconcileInterval)
 	}
+	if cfg.UsageLimitPause != 30*time.Minute {
+		t.Errorf("UsageLimitPause = %v, want 30m", cfg.UsageLimitPause)
+	}
 	if cfg.Port != 8080 {
 		t.Errorf("Port = %d, want 8080", cfg.Port)
 	}

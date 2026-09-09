@@ -4,12 +4,33 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// ErrUsageLimit — claude сообщил об исчерпанном лимите использования (usage
+// limit/rate limit подписки или API), а не о реальном сбое. Вызывающая
+// сторона (см. очередь) должна поставить проверку этой задачи на паузу и
+// дать сверке повторить попытку позже, а не считать прогон окончательно
+// проваленным. Проверяется через errors.Is — RunSpec/RunReview оборачивают
+// эту ошибку через %w.
+var ErrUsageLimit = errors.New("claude usage limit reached")
+
+// usageLimitPattern ищет в тексте ответа claude или в stderr процесса
+// признаки исчерпанного лимита использования. claude -p в этом случае
+// завершается штатно (is_error=true, subtype="error_during_execution") и
+// не даёт отдельного структурированного поля с точным временем сброса —
+// поэтому определяем по формулировке, а не по коду ошибки.
+var usageLimitPattern = regexp.MustCompile(`(?i)usage limit|rate limit|usage credit|credit balance is too low|out of usage credits|quota exceeded|overloaded_error`)
+
+func isUsageLimitMessage(s string) bool {
+	return usageLimitPattern.MatchString(s)
+}
 
 // Runner запускает claude -p в рабочей копии репозитория. ClaudeBinary
 // подставляется в тестах вместо реального "claude".
@@ -147,12 +168,18 @@ func isGitRepo(dir string) bool {
 }
 
 // SpecFilePath возвращает путь, по которому /spec обязан сохранить ТЗ задачи.
+//
+// Каталог специально НЕ внутри .claude/: Claude Code относит всё под
+// .claude/ к чувствительным путям и блокирует запись в них тулом Write
+// независимо от --allowedTools (проверено эмпирически — ни широкое "Write",
+// ни точечный паттерн "Write(.claude/specs/**)" разрешения не дают). Обычная
+// директория specs/ в корне рабочей копии под то же ограничение не подпадает.
 func (r *Runner) SpecFilePath(taskID string) string {
-	return filepath.Join(r.RepoPath, ".claude", "specs", taskID+".md")
+	return filepath.Join(r.RepoPath, "specs", taskID+".md")
 }
 
 // RunSpec запускает "/spec\n<url задачи>" отдельной сессией claude. Команда
-// сама пишет .claude/specs/<ID>.md — вызывающая сторона проверяет файл
+// сама пишет specs/<ID>.md — вызывающая сторона проверяет файл
 // после возврата (см. RunSpec в очереди задач и Требование 5.2).
 func (r *Runner) RunSpec(ctx context.Context, taskURL string) (sessionID string, usage TokenUsage, err error) {
 	prompt := "/spec\n" + taskURL
@@ -220,15 +247,24 @@ func (r *Runner) run(ctx context.Context, prompt string) (claudeJSONResult, stri
 	var result claudeJSONResult
 	if parseErr := json.Unmarshal(stdout.Bytes(), &result); parseErr != nil {
 		if runErr != nil {
+			if isUsageLimitMessage(stderr.String()) {
+				return claudeJSONResult{}, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(stderr.String(), 500))
+			}
 			return claudeJSONResult{}, stderr.String(), fmt.Errorf("claude process failed: %w", runErr)
 		}
 		return claudeJSONResult{}, stderr.String(), fmt.Errorf("parse claude json output: %w (raw: %s)", parseErr, truncate(stdout.String(), 2000))
 	}
 
 	if runErr != nil {
+		if isUsageLimitMessage(result.Result) || isUsageLimitMessage(stderr.String()) {
+			return result, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(result.Result, 500))
+		}
 		return result, stderr.String(), fmt.Errorf("claude process failed: %w", runErr)
 	}
 	if result.IsError {
+		if isUsageLimitMessage(result.Result) {
+			return result, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(result.Result, 500))
+		}
 		return result, stderr.String(), fmt.Errorf("claude reported an error: %s", result.Result)
 	}
 
