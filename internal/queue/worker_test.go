@@ -74,12 +74,14 @@ func (f *fakeClickUp) AddComment(ctx context.Context, taskID, text string) error
 
 // fakeRunner — фейковая реализация интерфейса Runner.
 type fakeRunner struct {
-	specErr    error
-	specExists bool
-	specUsage  review.TokenUsage
-	result     review.Result
-	reviewErr  error
-	gitErr     error
+	specErr         error
+	specExists      bool   // существует для любого запрошенного ID
+	specExistsForID string // существует только для конкретного ID (приоритет над specExists)
+	specUsage       review.TokenUsage
+	result          review.Result
+	reviewErr       error
+	gitErr          error
+	gotSpecPath     string // specPath, с которым реально вызвали RunReview
 }
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
@@ -89,11 +91,16 @@ func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, revie
 }
 
 func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error) {
+	f.gotSpecPath = specPath
 	return f.result, f.reviewErr
 }
 
 func (f *fakeRunner) SpecFilePath(taskID string) string {
-	if f.specExists {
+	exists := f.specExists
+	if f.specExistsForID != "" {
+		exists = taskID == f.specExistsForID
+	}
+	if exists {
 		// Существующий файл: сам тестовый бинарь на диске годится как заглушка.
 		return filepath.Join(".", "worker_test.go")
 	}
@@ -432,4 +439,118 @@ func TestProcessTask_MissingRequiredCommands_AbortsWithoutRunningReview(t *testi
 	if _, enqueued, err := deps.Store.TryEnqueue(context.Background(), "9"); err != nil || !enqueued {
 		t.Fatalf("expected task to be re-enqueueable after missing-commands failure: enqueued=%v err=%v", enqueued, err)
 	}
+}
+
+func TestProcessTask_UsesCustomIDForSpecFileWhenPresent(t *testing.T) {
+	task := &clickup.Task{
+		ID: "869d9kt6a", CustomID: "PNL-4528", Name: "Task 10", URL: "https://app.clickup.com/t/869d9kt6a",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExistsForID: "PNL-4528", // /spec сохранила файл по человекочитаемому ID, а не нативному
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("10")
+
+	want := filepath.Join(".claude", "specs", "PNL-4528.md")
+	if runner.gotSpecPath != want {
+		t.Errorf("specPath passed to RunReview = %q, want %q", runner.gotSpecPath, want)
+	}
+}
+
+func TestResumeTask_BypassesEligibility(t *testing.T) {
+	// Статус "checking", а не STATUS_TRIGGER ("to check") — обычный
+	// processTask пропустил бы такую задачу. resumeTask обязана довести её
+	// до конца: ревью уже было начато, а прогон прервался крахом/сигналом.
+	task := &clickup.Task{
+		ID: "11", Name: "Task 11", URL: "https://app.clickup.com/t/11",
+		ListID: "list1", Tags: []string{"ai"}, Status: "checking",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.resumeTask("11")
+
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 slack notifications (started + finished) for a resumed task, got %d", len(*calls))
+	}
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.statuses) != 2 || cu.statuses[1] != "done" {
+		t.Errorf("expected resumed task to reach STATUS_PASS despite not matching trigger condition, got: %+v", cu.statuses)
+	}
+}
+
+func TestResumeTask_AlreadyDone_SkipsWithoutReprocessing(t *testing.T) {
+	task := &clickup.Task{ID: "12", Name: "Task 12", URL: "https://app.clickup.com/t/12", ListID: "list1"}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	deps.Store.MarkDone(context.Background(), mustEnqueue(t, deps, "12"), "pass", "s", store.Usage{})
+
+	q := New(deps, 10)
+	q.resumeTask("12")
+
+	if len(*calls) != 0 {
+		t.Fatalf("expected no reprocessing for a task that already has a done run, got %d slack calls", len(*calls))
+	}
+}
+
+func mustEnqueue(t *testing.T, deps Deps, taskID string) int64 {
+	t.Helper()
+	id, _, err := deps.Store.TryEnqueue(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	return id
+}
+
+func TestQueue_SubmitResume_BypassesEligibilityThroughRealDispatch(t *testing.T) {
+	task := &clickup.Task{
+		ID: "13", Name: "Task 13", URL: "https://app.clickup.com/t/13",
+		ListID: "list1", Tags: []string{"other"}, Status: "checking", // не проходит isEligible
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.Start(1)
+	q.SubmitResume("13")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if len(*calls) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for resumed task to be processed via real dispatch, got %d slack calls", len(*calls))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	q.Shutdown(time.Second)
 }

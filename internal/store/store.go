@@ -215,16 +215,36 @@ func (s *Store) MarkFailed(ctx context.Context, runID int64, sessionID, errMsg s
 
 // RecoverFromRestart переводит все прогоны в состоянии running в failed при
 // старте сервиса: контейнер мог перезапуститься посреди ревью, зависшая
-// задача не должна блокировать повторную обработку.
-func (s *Store) RecoverFromRestart(ctx context.Context) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `
+// задача не должна блокировать повторную обработку. Возвращает task_id всех
+// затронутых прогонов — вызывающая сторона доводит их до конца (см.
+// Queue.SubmitResume), а не просто ждёт, пока их снова найдёт сверка.
+func (s *Store) RecoverFromRestart(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT task_id FROM runs WHERE status = ?`, StatusRunning)
+	if err != nil {
+		return nil, fmt.Errorf("recover from restart: list running: %w", err)
+	}
+	var taskIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("recover from restart: scan task_id: %w", err)
+		}
+		taskIDs = append(taskIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("recover from restart: iterate rows: %w", err)
+	}
+	rows.Close()
+
+	if _, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET status = ?, error = ?, finished_at = ?
 		WHERE status = ?
-	`, StatusFailed, "restarted: service was terminated mid-run", time.Now().UTC(), StatusRunning)
-	if err != nil {
-		return 0, fmt.Errorf("recover from restart: %w", err)
+	`, StatusFailed, "restarted: service was terminated mid-run", time.Now().UTC(), StatusRunning); err != nil {
+		return nil, fmt.Errorf("recover from restart: %w", err)
 	}
-	return res.RowsAffected()
+	return taskIDs, nil
 }
 
 // Ping проверяет, что база данных открыта и отвечает (используется в /readyz).

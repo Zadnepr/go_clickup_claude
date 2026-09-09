@@ -76,6 +76,7 @@ func (c *Client) Close() {
 // поля, нужные Go-сервису для принятия решений и сантехники.
 type Task struct {
 	ID                string
+	CustomID          string // человекочитаемый ID вида "PNL-4528", если задан в ClickUp
 	Name              string
 	URL               string
 	Status            string
@@ -182,10 +183,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query url.V
 
 // rawTask отражает нужные нам поля ответа GET /task/{id}.
 type rawTask struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	URL  string `json:"url"`
-	Tags []struct {
+	ID       string `json:"id"`
+	CustomID string `json:"custom_id"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Tags     []struct {
 		Name string `json:"name"`
 	} `json:"tags"`
 	Status struct {
@@ -216,6 +218,7 @@ func (c *Client) GetTask(ctx context.Context, taskID string) (*Task, error) {
 
 	task := &Task{
 		ID:        raw.ID,
+		CustomID:  raw.CustomID,
 		Name:      raw.Name,
 		URL:       raw.URL,
 		Status:    raw.Status.Status,
@@ -353,6 +356,7 @@ func (c *Client) ListTasksByTagAndStatus(ctx context.Context, listID, tag, statu
 	for _, rt := range raw.Tasks {
 		t := Task{
 			ID:        rt.ID,
+			CustomID:  rt.CustomID,
 			Name:      rt.Name,
 			URL:       rt.URL,
 			Status:    rt.Status.Status,

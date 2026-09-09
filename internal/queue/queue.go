@@ -5,12 +5,19 @@ import (
 	"time"
 )
 
+// queueItem — один элемент буферизованного канала: task_id и признак,
+// что это восстановленный после рестарта прогон (см. SubmitResume).
+type queueItem struct {
+	taskID string
+	resume bool
+}
+
 // Queue — буферизованный канал task_id плюс пул воркеров (WORKER_CONCURRENCY).
 // Переполнение буфера не теряет событие безвозвратно: сверка (Требование 1.2)
 // подберёт задачу позже.
 type Queue struct {
 	deps Deps
-	ch   chan string
+	ch   chan queueItem
 	wg   sync.WaitGroup
 }
 
@@ -19,18 +26,36 @@ func New(deps Deps, bufferSize int) *Queue {
 	if bufferSize <= 0 {
 		bufferSize = 100
 	}
-	return &Queue{deps: deps, ch: make(chan string, bufferSize)}
+	return &Queue{deps: deps, ch: make(chan queueItem, bufferSize)}
 }
 
 // Submit кладёт task_id в очередь без блокировки. При переполненном буфере
 // событие отбрасывается с предупреждением в лог — это безопасно благодаря
-// сверке. Вызывается и вебхуком, и тикером сверки — оба ведут в одну функцию.
+// сверке. Вызывается и вебхуком, и тикером сверки, и ручным /api/run — все
+// три источника ведут в одну функцию постановки в очередь.
 func (q *Queue) Submit(taskID string) bool {
 	select {
-	case q.ch <- taskID:
+	case q.ch <- queueItem{taskID: taskID}:
 		return true
 	default:
 		q.deps.Logger.Warn("queue buffer is full, dropping event; reconcile will pick it up later", "task_id", taskID)
+		return false
+	}
+}
+
+// SubmitResume ставит в очередь задачу, прогон которой прервался (контейнер
+// упал или был убит сигналом посреди ревью — см. Store.RecoverFromRestart).
+// В отличие от Submit, обработка этой задачи **не проверяет условие
+// триггера** (тег/статус/список): раз ревью уже было начато, оно доводится
+// до конца независимо от того, как сейчас выглядит карточка в ClickUp
+// (например, она может застрять в колонке STATUS_RUNNING без тега).
+func (q *Queue) SubmitResume(taskID string) bool {
+	select {
+	case q.ch <- queueItem{taskID: taskID, resume: true}:
+		return true
+	default:
+		q.deps.Logger.Warn("queue buffer is full, dropping resumed task; it will stay stuck until manually retried",
+			"task_id", taskID)
 		return false
 	}
 }
@@ -44,8 +69,12 @@ func (q *Queue) Start(workers int) {
 		q.wg.Add(1)
 		go func() {
 			defer q.wg.Done()
-			for taskID := range q.ch {
-				q.processTask(taskID)
+			for item := range q.ch {
+				if item.resume {
+					q.resumeTask(item.taskID)
+				} else {
+					q.processTask(item.taskID)
+				}
 			}
 		}()
 	}

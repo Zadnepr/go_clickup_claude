@@ -71,6 +71,18 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 	return config.NormalizeStatus(task.Status) == config.NormalizeStatus(cfg.StatusTrigger)
 }
 
+// specFileCandidateIDs возвращает ID, по которым /spec могла сохранить файл
+// ТЗ, в порядке приоритета. /spec называет файл `.claude/specs/<ID задачи>.md`,
+// и на практике команда предпочитает человекочитаемый custom_id (например,
+// "PNL-4528"), если он у задачи задан — иначе использует нативный ID ClickUp.
+// Проверяем оба варианта, чтобы не промахнуться мимо реально созданного файла.
+func specFileCandidateIDs(task *clickup.Task) []string {
+	if task.CustomID != "" {
+		return []string{task.CustomID, task.ID}
+	}
+	return []string{task.ID}
+}
+
 // missingCommands проверяет наличие .claude/commands/{spec,review}.md в
 // рабочей копии репозитория — без них claude не сможет содержательно
 // отработать, и запускать процесс нет смысла.
@@ -116,6 +128,40 @@ func (q *Queue) processTask(taskID string) {
 		return
 	}
 
+	q.runReview(ctx, log, task, runID)
+}
+
+// resumeTask доводит до конца прогон, прерванный крахом или убийством
+// процесса (см. Store.RecoverFromRestart), — при старте сервиса, а не по
+// событию. В отличие от processTask, условие триггера (тег/статус/список)
+// не проверяется: ревью уже было начато для этой задачи, и его нужно
+// завершить (перевести в нужную колонку, оставить комментарий) независимо
+// от того, как сейчас выглядит карточка в ClickUp — например, она может
+// застрять в STATUS_RUNNING без тега, если тот успел слететь раньше обрыва.
+func (q *Queue) resumeTask(taskID string) {
+	cfg := q.deps.Cfg
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ReviewTimeout)
+	defer cancel()
+
+	log := q.deps.Logger.With("task_id", taskID, "resumed", true)
+
+	task, err := q.deps.ClickUp.GetTask(ctx, taskID)
+	if err != nil {
+		log.Error("failed to fetch task for resume, giving up until reconcile finds it again", "error", err.Error())
+		return
+	}
+
+	runID, enqueued, err := q.deps.Store.TryEnqueue(ctx, taskID)
+	if err != nil {
+		log.Error("failed to record resumed run in store", "error", err.Error())
+		return
+	}
+	if !enqueued {
+		log.Debug("resumed task already has an active or completed run, skipping")
+		return
+	}
+
+	log.Info("resuming review interrupted by a previous instance")
 	q.runReview(ctx, log, task, runID)
 }
 
@@ -170,9 +216,13 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	specPath := ""
-	if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(task.ID)); statErr == nil {
-		specPath = filepath.Join(".claude", "specs", task.ID+".md")
-	} else {
+	for _, id := range specFileCandidateIDs(task) {
+		if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(id)); statErr == nil {
+			specPath = filepath.Join(".claude", "specs", id+".md")
+			break
+		}
+	}
+	if specPath == "" {
 		log.Warn("/spec did not produce a spec file, running /review with the task link only")
 	}
 

@@ -27,6 +27,7 @@ func TestGetTask(t *testing.T) {
 			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"id":        "123",
+				"custom_id": "PNL-4528",
 				"name":      "Fix bug",
 				"url":       "https://app.clickup.com/t/123",
 				"tags":      []map[string]string{{"name": "ai"}, {"name": "urgent"}},
@@ -50,6 +51,9 @@ func TestGetTask(t *testing.T) {
 	}
 	if task.Name != "Fix bug" || task.Status != "to check" || task.ListID != "list1" || task.CreatorID != 42 {
 		t.Errorf("unexpected task: %+v", task)
+	}
+	if task.CustomID != "PNL-4528" {
+		t.Errorf("CustomID = %q, want PNL-4528", task.CustomID)
 	}
 	if len(task.Tags) != 2 || task.Tags[0] != "ai" {
 		t.Errorf("unexpected tags: %+v", task.Tags)

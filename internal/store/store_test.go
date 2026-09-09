@@ -108,12 +108,12 @@ func TestRecoverFromRestart(t *testing.T) {
 		t.Fatalf("MarkRunning error: %v", err)
 	}
 
-	n, err := s.RecoverFromRestart(ctx)
+	taskIDs, err := s.RecoverFromRestart(ctx)
 	if err != nil {
 		t.Fatalf("RecoverFromRestart error: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected 1 recovered run, got %d", n)
+	if len(taskIDs) != 1 || taskIDs[0] != "task-4" {
+		t.Fatalf("expected [task-4] recovered, got %+v", taskIDs)
 	}
 
 	run, err := s.GetRun(ctx, id)
@@ -127,6 +127,33 @@ func TestRecoverFromRestart(t *testing.T) {
 	// После восстановления задача должна снова браться в работу.
 	if _, ok, err := s.TryEnqueue(ctx, "task-4"); err != nil || !ok {
 		t.Fatalf("expected enqueue to succeed after restart recovery: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRecoverFromRestart_MultipleRunningTasks(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	for _, taskID := range []string{"task-a", "task-b"} {
+		id, _, err := s.TryEnqueue(ctx, taskID)
+		if err != nil {
+			t.Fatalf("TryEnqueue(%s) error: %v", taskID, err)
+		}
+		if err := s.MarkRunning(ctx, id); err != nil {
+			t.Fatalf("MarkRunning(%s) error: %v", taskID, err)
+		}
+	}
+
+	taskIDs, err := s.RecoverFromRestart(ctx)
+	if err != nil {
+		t.Fatalf("RecoverFromRestart error: %v", err)
+	}
+	got := map[string]bool{}
+	for _, id := range taskIDs {
+		got[id] = true
+	}
+	if len(taskIDs) != 2 || !got["task-a"] || !got["task-b"] {
+		t.Fatalf("expected [task-a task-b] recovered, got %+v", taskIDs)
 	}
 }
 

@@ -90,10 +90,12 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer st.Close()
 
-	if n, err := st.RecoverFromRestart(context.Background()); err != nil {
+	var recoveredTaskIDs []string
+	if ids, err := st.RecoverFromRestart(context.Background()); err != nil {
 		logger.Error("failed to recover runs after restart", "error", err.Error())
-	} else if n > 0 {
-		logger.Warn("recovered runs left running by a previous instance", "count", n)
+	} else if len(ids) > 0 {
+		logger.Warn("recovered runs left running by a previous instance, resuming them", "count", len(ids), "task_ids", ids)
+		recoveredTaskIDs = ids
 	}
 
 	cuClient := clickup.NewClient(cfg.CUAPIToken, cfg.CUTeamID, clickup.WithLogger(logger))
@@ -111,6 +113,13 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		Logger:  logger,
 	}, 100)
 	q.Start(cfg.WorkerConcurrency)
+
+	// Прогоны, прерванные предыдущим падением/убийством процесса, доводятся
+	// до конца в первую очередь, независимо от того, как сейчас выглядит
+	// карточка задачи в ClickUp (см. Queue.SubmitResume).
+	for _, taskID := range recoveredTaskIDs {
+		q.SubmitResume(taskID)
+	}
 
 	mux := httpapi.NewMux(httpapi.Deps{
 		Queue:         q,
@@ -140,11 +149,19 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		go runReconcileLoop(cfg, cuClient, q, logger, stopReconcile)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	// Обычный signal.Notify, а не NotifyContext: NotifyContext перехватывает
+	// сигнал только один раз и после первого срабатывания возвращает его
+	// обработку в дефолтный режим — повторный SIGTERM (обычное дело при
+	// docker stop/пересоздании через Compose) тогда убивает процесс мгновенно
+	// и обрывает текущий прогон ревью, даже не дав graceful shutdown начаться
+	// толком. Регистрация здесь остаётся активной до конца жизни процесса,
+	// поэтому любые последующие SIGTERM/SIGINT продолжают уходить в канал,
+	// а не в дефолтный обработчик ОС.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	select {
-	case <-ctx.Done():
+	case <-sigCh:
 		logger.Info("shutdown signal received")
 	case err := <-serverErr:
 		logger.Error("http server failed", "error", err.Error())
