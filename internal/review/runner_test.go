@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -40,11 +41,13 @@ exit %d
 
 func TestRunner_RunReview_ParsesOutputAndSession(t *testing.T) {
 	out := claudeJSONResult{
-		Type:      "result",
-		Subtype:   "success",
-		IsError:   false,
-		Result:    "Ревью готово.\nИТОГ: критичных=1 важных=0 минор=0 статус=fail",
-		SessionID: "sess-123",
+		Type:         "result",
+		Subtype:      "success",
+		IsError:      false,
+		Result:       "Ревью готово.\nИТОГ: критичных=1 важных=0 минор=0 статус=fail",
+		SessionID:    "sess-123",
+		TotalCostUSD: 0.0234,
+		Usage:        claudeUsage{InputTokens: 1200, OutputTokens: 340},
 	}
 	b, _ := json.Marshal(out)
 
@@ -60,6 +63,43 @@ func TestRunner_RunReview_ParsesOutputAndSession(t *testing.T) {
 	}
 	if res.Verdict.Status != StatusFail || res.Verdict.Critical != 1 {
 		t.Errorf("unexpected verdict: %+v", res.Verdict)
+	}
+	if res.Usage.InputTokens != 1200 || res.Usage.OutputTokens != 340 || res.Usage.CostUSD != 0.0234 {
+		t.Errorf("unexpected token usage: %+v", res.Usage)
+	}
+}
+
+func TestRunner_RunSpec_ReturnsUsage(t *testing.T) {
+	out := claudeJSONResult{
+		Type:         "result",
+		Result:       "spec written",
+		SessionID:    "spec-sess",
+		TotalCostUSD: 0.001,
+		Usage:        claudeUsage{InputTokens: 500, OutputTokens: 50},
+	}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
+
+	sessionID, usage, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123")
+	if err != nil {
+		t.Fatalf("RunSpec error: %v", err)
+	}
+	if sessionID != "spec-sess" {
+		t.Errorf("sessionID = %q, want spec-sess", sessionID)
+	}
+	if usage.InputTokens != 500 || usage.OutputTokens != 50 || usage.CostUSD != 0.001 {
+		t.Errorf("unexpected usage: %+v", usage)
+	}
+}
+
+func TestTokenUsage_Add(t *testing.T) {
+	a := TokenUsage{InputTokens: 100, OutputTokens: 20, CostUSD: 0.01}
+	b := TokenUsage{InputTokens: 50, OutputTokens: 5, CostUSD: 0.002}
+	sum := a.Add(b)
+	if sum.InputTokens != 150 || sum.OutputTokens != 25 || sum.CostUSD != 0.012 {
+		t.Errorf("unexpected sum: %+v", sum)
 	}
 }
 
@@ -105,6 +145,97 @@ func TestRunner_RunReview_WithSpecPath(t *testing.T) {
 	}
 	if res.Verdict.Status != StatusPass {
 		t.Errorf("unexpected verdict: %+v", res.Verdict)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v (dir=%s) failed: %v\n%s", args, dir, err, out)
+	}
+}
+
+// initRepoWithOrigin делает dir git-репозиторием с рабочим remote "origin"
+// (локальный bare-репозиторий), чтобы `git fetch --prune origin` реально
+// отрабатывал успешно в тестах, без сети.
+func initRepoWithOrigin(t *testing.T, dir string) {
+	t.Helper()
+	bareDir := filepath.Join(t.TempDir(), "origin.git")
+	runGit(t, "", "init", "--bare", "--initial-branch=main", bareDir)
+	runGit(t, dir, "init", "--initial-branch=main")
+	runGit(t, dir, "remote", "add", "origin", bareDir)
+}
+
+func TestGitFetch_SingleRepoAtRoot(t *testing.T) {
+	root := t.TempDir()
+	initRepoWithOrigin(t, root)
+
+	r := &Runner{RepoPath: root}
+	if err := r.GitFetch(context.Background()); err != nil {
+		t.Fatalf("GitFetch error: %v", err)
+	}
+}
+
+func TestGitFetch_MultipleReposAsSubdirsOfPlainRoot(t *testing.T) {
+	root := t.TempDir() // сам root НЕ git-репозиторий
+	repoA := filepath.Join(root, "panels")
+	repoB := filepath.Join(root, "sommerce")
+	if err := os.MkdirAll(repoA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initRepoWithOrigin(t, repoA)
+	initRepoWithOrigin(t, repoB)
+
+	r := &Runner{RepoPath: root}
+	if err := r.GitFetch(context.Background()); err != nil {
+		t.Fatalf("GitFetch error: %v", err)
+	}
+}
+
+func TestGitFetch_NoRepositoriesFound(t *testing.T) {
+	root := t.TempDir() // пустой каталог, ни один git-репозиторий не найден
+
+	r := &Runner{RepoPath: root}
+	if err := r.GitFetch(context.Background()); err == nil {
+		t.Fatal("expected error when no git repository is found")
+	}
+}
+
+func TestGitFetch_PartialFailureStillSucceeds(t *testing.T) {
+	root := t.TempDir()
+	goodRepo := filepath.Join(root, "good")
+	badRepo := filepath.Join(root, "bad")
+	if err := os.MkdirAll(goodRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(badRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initRepoWithOrigin(t, goodRepo)
+	runGit(t, badRepo, "init", "--initial-branch=main") // без remote "origin" — fetch здесь упадёт
+
+	r := &Runner{RepoPath: root}
+	if err := r.GitFetch(context.Background()); err != nil {
+		t.Fatalf("expected success when at least one repo fetches OK, got error: %v", err)
+	}
+}
+
+func TestGitFetch_AllRepositoriesFail(t *testing.T) {
+	root := t.TempDir()
+	badRepo := filepath.Join(root, "bad")
+	if err := os.MkdirAll(badRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, badRepo, "init", "--initial-branch=main") // без remote "origin"
+
+	r := &Runner{RepoPath: root}
+	if err := r.GitFetch(context.Background()); err == nil {
+		t.Fatal("expected error when every discovered repository fails to fetch")
 	}
 }
 

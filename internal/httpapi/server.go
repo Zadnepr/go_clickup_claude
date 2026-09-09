@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
 // Submitter — то немногое от очереди, что нужно HTTP-слою.
@@ -16,16 +18,20 @@ type Submitter interface {
 	Submit(taskID string) bool
 }
 
-// Pinger проверяет доступность зависимости (используется в /readyz).
-type Pinger interface {
+// DataStore — то немногое от Store, что нужно HTTP-слою: /readyz, /api/status
+// и /api/stats.
+type DataStore interface {
 	Ping(ctx context.Context) error
+	ListActive(ctx context.Context) ([]store.Run, error)
+	Stats(ctx context.Context, since time.Time) (store.Stats, error)
 }
 
 // Deps — зависимости HTTP-слоя.
 type Deps struct {
 	Queue         Submitter
-	WebhookSecret string // пусто -> эндпоинт вебхука не регистрируется
-	Store         Pinger
+	Trigger       ManualRunner // ручной запуск через POST /api/run
+	WebhookSecret string       // пусто -> эндпоинт вебхука не регистрируется
+	Store         DataStore
 	RepoPath      string
 	ClaudeBinary  string // по умолчанию "claude"
 	Logger        *slog.Logger
@@ -51,6 +57,10 @@ func NewMux(deps Deps) *http.ServeMux {
 
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /readyz", newReadyzHandler(deps))
+
+	mux.HandleFunc("POST /api/run", newRunHandler(deps))
+	mux.HandleFunc("GET /api/status", newStatusHandler(deps))
+	mux.HandleFunc("GET /api/stats", newStatsHandler(deps))
 
 	return mux
 }

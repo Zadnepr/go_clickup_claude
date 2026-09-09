@@ -81,6 +81,42 @@ func TestBuildReviewMessage_ContainsRequiredFields(t *testing.T) {
 	}
 }
 
+func TestBuildShortResultMessage(t *testing.T) {
+	text, blocks := BuildShortResultMessage(ReviewNotification{
+		TaskName:   "Fix login bug",
+		TaskURL:    "https://app.clickup.com/t/123",
+		Verdict:    "fail",
+		FromStatus: "checking",
+		ToStatus:   "rework",
+		Assignee:   "81838079",
+	})
+	if !strings.Contains(text, "Fix login bug") || !strings.Contains(text, "checking") || !strings.Contains(text, "rework") {
+		t.Errorf("expected task name and columns in text, got: %s", text)
+	}
+	dump, _ := json.Marshal(blocks)
+	body := string(dump)
+	for _, want := range []string{"Fix login bug", "checking", "rework", "81838079"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected short message to contain %q, got: %s", want, body)
+		}
+	}
+	// Короткое сообщение не должно содержать разбивку по уровням замечаний.
+	if strings.Contains(body, "критичных") {
+		t.Errorf("expected short message to omit finding counts, got: %s", body)
+	}
+}
+
+func TestBuildStartedMessage(t *testing.T) {
+	text, blocks := BuildStartedMessage("Fix login bug", "https://app.clickup.com/t/123")
+	if !strings.Contains(text, "Fix login bug") || !strings.Contains(text, "app.clickup.com/t/123") {
+		t.Errorf("expected task name and url in text, got: %s", text)
+	}
+	dump, _ := json.Marshal(blocks)
+	if !strings.Contains(string(dump), "Fix login bug") {
+		t.Errorf("expected task name in blocks, got: %s", string(dump))
+	}
+}
+
 func TestBuildBlockedMessage(t *testing.T) {
 	text, blocks := BuildBlockedMessage(ReviewNotification{TaskName: "T", TaskURL: "https://x/1"}, "ветка не найдена")
 	if !strings.Contains(text, "заблокировано") {

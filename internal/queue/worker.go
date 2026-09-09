@@ -16,19 +16,25 @@ import (
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
+// requiredCommands — slash-команды, без которых /spec и /review не смогут
+// отработать содержательно; проверяются перед запуском claude.
+var requiredCommands = []string{"spec.md", "review.md"}
+
 // ClickUp — часть API ClickUp, нужная воркеру очереди. Позволяет подменять
 // реальный клиент фейком в тестах.
 type ClickUp interface {
 	GetTask(ctx context.Context, taskID string) (*clickup.Task, error)
 	SetStatus(ctx context.Context, taskID, status string) error
 	AddAssignees(ctx context.Context, taskID string, userIDs []int) error
+	RemoveAssignees(ctx context.Context, taskID string, userIDs []int) error
+	RemoveTag(ctx context.Context, taskID, tagName string) error
 	AddComment(ctx context.Context, taskID, text string) error
 }
 
 // Runner — часть API запуска claude, нужная воркеру очереди.
 type Runner interface {
 	GitFetch(ctx context.Context) error
-	RunSpec(ctx context.Context, taskURL string) (sessionID string, err error)
+	RunSpec(ctx context.Context, taskURL string) (sessionID string, usage review.TokenUsage, err error)
 	RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error)
 	SpecFilePath(taskID string) string
 }
@@ -65,9 +71,23 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 	return config.NormalizeStatus(task.Status) == config.NormalizeStatus(cfg.StatusTrigger)
 }
 
+// missingCommands проверяет наличие .claude/commands/{spec,review}.md в
+// рабочей копии репозитория — без них claude не сможет содержательно
+// отработать, и запускать процесс нет смысла.
+func missingCommands(repoPath string) []string {
+	var missing []string
+	for _, name := range requiredCommands {
+		rel := filepath.Join(".claude", "commands", name)
+		if _, err := os.Stat(filepath.Join(repoPath, rel)); err != nil {
+			missing = append(missing, rel)
+		}
+	}
+	return missing
+}
+
 // processTask прогоняет одну задачу через полный цикл: проверка условия,
 // дедупликация, перевод в running, /spec+/review, переходы статуса и
-// исполнителя, комментарий, уведомление в Slack.
+// исполнителя, комментарий, уведомление в Slack и в лог.
 func (q *Queue) processTask(taskID string) {
 	cfg := q.deps.Cfg
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ReviewTimeout)
@@ -114,15 +134,36 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		log.Error("failed to mark run as running", "error", err.Error())
 	}
 
+	// Снимаем текущих исполнителей на время проверки — запоминаем их, чтобы
+	// при провале вернуть работу тому же человеку (или создателю, если
+	// исполнителей не было). Успех переназначает задачу отдельному ревьюеру
+	// (ASSIGNEE_ON_PASS), поэтому снятые здесь люди для успешного пути не нужны.
+	originalAssignees := append([]int(nil), task.Assignees...)
+	if len(originalAssignees) > 0 {
+		if err := q.deps.ClickUp.RemoveAssignees(ctx, task.ID, originalAssignees); err != nil {
+			log.Error("failed to remove assignees before check", "assignees", originalAssignees, "error", err.Error())
+		}
+	}
+
+	q.notifyStarted(ctx, log, task)
+
+	if missing := missingCommands(cfg.RepoPath); len(missing) > 0 {
+		errMsg := fmt.Sprintf("не найдены обязательные команды: %s", strings.Join(missing, ", "))
+		log.Error("required slash commands are missing, aborting run", "missing", missing)
+		q.notifyServiceError(ctx, log, task, errMsg)
+		q.markFailed(ctx, log, runID, "", errMsg, review.TokenUsage{})
+		return
+	}
+
 	if err := q.deps.Runner.GitFetch(ctx); err != nil {
 		errMsg := "git fetch failed: " + err.Error()
 		log.Error("git fetch failed, aborting run", "error", err.Error())
 		q.notifyServiceError(ctx, log, task, errMsg)
-		q.markFailed(ctx, log, runID, "", errMsg)
+		q.markFailed(ctx, log, runID, "", errMsg, review.TokenUsage{})
 		return
 	}
 
-	specSessionID, err := q.deps.Runner.RunSpec(ctx, task.URL)
+	specSessionID, specUsage, err := q.deps.Runner.RunSpec(ctx, task.URL)
 	if err != nil {
 		log.Warn("/spec run failed, falling back to a single task link for /review",
 			"error", err.Error(), "spec_session_id", specSessionID)
@@ -136,6 +177,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	result, reviewErr := q.deps.Runner.RunReview(ctx, task.URL, specPath)
+	totalUsage := specUsage.Add(result.Usage)
 	verdict := result.Verdict
 	if reviewErr != nil {
 		log.Error("/review run failed", "error", reviewErr.Error(), "stderr", truncateForLog(result.Stderr))
@@ -143,25 +185,42 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		log.Warn("review output had no parsable ИТОГ line, treating as blocked")
 	}
 
-	targetStatus, assigneeIDs := Decide(verdict, cfg, task.CreatorID)
-
-	if targetStatus != "" {
-		if err := q.deps.ClickUp.SetStatus(ctx, task.ID, targetStatus); err != nil {
-			log.Error("failed to move task to target status",
-				"attempted_status", targetStatus,
-				"available_statuses", task.AvailableStatuses,
-				"error", err.Error())
-		}
-	}
-
-	if len(assigneeIDs) > 0 {
-		if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, assigneeIDs); err != nil {
-			log.Error("failed to add assignees", "assignees", assigneeIDs, "error", err.Error())
-		}
-	}
-
 	if strings.TrimSpace(result.Output) != "" {
 		q.postComment(ctx, log, task.ID, result.SessionID, result.Output)
+	}
+
+	// Реальный сбой процесса (не смог запуститься, упал, protухший токен,
+	// таймаут) — это не результат ревью, а инфраструктурная проблема Go/claude.
+	// Задачу нельзя трогать так, будто её реально проверили: статус, тег и
+	// исполнитель остаются как есть — карточка так и останется в running-
+	// колонке до ручного возврата или повторного запуска, но не получит
+	// ложный вердикт. Только настоящий ответ /review (даже blocked) меняет
+	// статус/тег/исполнителя.
+	var targetStatus string
+	var assigneeIDs []int
+	if reviewErr == nil {
+		targetStatus, assigneeIDs = Decide(verdict, cfg, task.CreatorID, originalAssignees)
+
+		if targetStatus != "" {
+			if err := q.deps.ClickUp.SetStatus(ctx, task.ID, targetStatus); err != nil {
+				log.Error("failed to move task to target status",
+					"attempted_status", targetStatus,
+					"available_statuses", task.AvailableStatuses,
+					"error", err.Error())
+			}
+		}
+
+		if len(assigneeIDs) > 0 {
+			if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, assigneeIDs); err != nil {
+				log.Error("failed to add assignees", "assignees", assigneeIDs, "error", err.Error())
+			}
+		}
+
+		if cfg.TriggerTag != "" {
+			if err := q.deps.ClickUp.RemoveTag(ctx, task.ID, cfg.TriggerTag); err != nil {
+				log.Error("failed to remove trigger tag", "tag", cfg.TriggerTag, "error", err.Error())
+			}
+		}
 	}
 
 	q.notifyReviewResult(ctx, log, task, verdict, cfg.StatusRunning, targetStatus, assigneeIDs, result.SessionID, reviewErr)
@@ -171,18 +230,26 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		if result.Stderr != "" {
 			errMsg += "; stderr: " + truncateForLog(result.Stderr)
 		}
-		q.markFailed(ctx, log, runID, result.SessionID, errMsg)
+		q.markFailed(ctx, log, runID, result.SessionID, errMsg, totalUsage)
 		return
 	}
 
-	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, result.SessionID); err != nil {
+	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, result.SessionID, storeUsage(totalUsage)); err != nil {
 		log.Error("failed to mark run done", "error", err.Error())
 	}
 }
 
-func (q *Queue) markFailed(ctx context.Context, log *slog.Logger, runID int64, sessionID, errMsg string) {
-	if err := q.deps.Store.MarkFailed(ctx, runID, sessionID, errMsg); err != nil {
+func (q *Queue) markFailed(ctx context.Context, log *slog.Logger, runID int64, sessionID, errMsg string, usage review.TokenUsage) {
+	if err := q.deps.Store.MarkFailed(ctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
 		log.Error("failed to mark run failed", "error", err.Error())
+	}
+}
+
+func storeUsage(u review.TokenUsage) store.Usage {
+	return store.Usage{
+		InputTokens:  int64(u.InputTokens),
+		OutputTokens: int64(u.OutputTokens),
+		CostUSD:      u.CostUSD,
 	}
 }
 
@@ -203,6 +270,10 @@ func (q *Queue) postComment(ctx context.Context, log *slog.Logger, taskID, sessi
 	}
 }
 
+// notifyReviewResult шлёт в Slack и в консоль короткое сообщение о том, что
+// сделано: задача и куда она перемещена. Для blocked и внутренних ошибок
+// сервиса сообщение отдельное и содержит причину — молчаливый отказ хуже
+// ложного срабатывания.
 func (q *Queue) notifyReviewResult(ctx context.Context, log *slog.Logger, task *clickup.Task, verdict review.Verdict, fromStatus, toStatus string, assigneeIDs []int, sessionID string, reviewErr error) {
 	n := slack.ReviewNotification{
 		TaskName:   task.Name,
@@ -229,11 +300,21 @@ func (q *Queue) notifyReviewResult(ctx context.Context, log *slog.Logger, task *
 		}
 		text, blocks = slack.BuildBlockedMessage(n, reason)
 	default:
-		text, blocks = slack.BuildReviewMessage(n)
+		text, blocks = slack.BuildShortResultMessage(n)
 	}
 
 	if err := q.deps.Slack.Send(ctx, text, blocks); err != nil {
 		log.Error("failed to send slack notification", "error", err.Error())
+	}
+
+	log.Info(fmt.Sprintf("задача «%s» обработана: %s → %s", task.Name, fromStatus, toStatus),
+		"verdict", verdict.Status, "assignees", assigneeIDs, "task_url", task.URL)
+}
+
+func (q *Queue) notifyStarted(ctx context.Context, log *slog.Logger, task *clickup.Task) {
+	text, blocks := slack.BuildStartedMessage(task.Name, task.URL)
+	if err := q.deps.Slack.Send(ctx, text, blocks); err != nil {
+		log.Error("failed to send slack start notification", "error", err.Error())
 	}
 }
 

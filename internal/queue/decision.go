@@ -15,7 +15,12 @@ import (
 // вердикту ревью (см. Требования 3 и 4). Критичные замечания и blocked
 // (ревью не смогло выполниться) — оба случая уходят в STATUS_FAIL: п.3
 // Требования 3 явно объединяет их в одном переходе.
-func Decide(v review.Verdict, cfg *config.Config, creatorID int) (targetStatus string, assigneeIDs []int) {
+//
+// originalAssignees — исполнители, которые были на задаче до того, как
+// воркер снял их на время проверки (см. Требование «снять асайны на время
+// проверки»); при провале они переназначаются обратно, если ASSIGNEE_ON_FAIL
+// не задан явно.
+func Decide(v review.Verdict, cfg *config.Config, creatorID int, originalAssignees []int) (targetStatus string, assigneeIDs []int) {
 	if v.Status == review.StatusPass {
 		if id, ok := parseUserID(cfg.AssigneeOnPass); ok {
 			assigneeIDs = []int{id}
@@ -25,6 +30,8 @@ func Decide(v review.Verdict, cfg *config.Config, creatorID int) (targetStatus s
 
 	if id, ok := parseUserID(cfg.AssigneeOnFail); ok {
 		assigneeIDs = []int{id}
+	} else if len(originalAssignees) > 0 {
+		assigneeIDs = append(assigneeIDs, originalAssignees...)
 	} else if creatorID != 0 {
 		assigneeIDs = []int{creatorID}
 	}

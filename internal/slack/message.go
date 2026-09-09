@@ -19,6 +19,19 @@ type ReviewNotification struct {
 	SessionID  string
 }
 
+// BuildStartedMessage формирует сообщение о начале проверки задачи —
+// отправляется сразу после того, как задача взята в работу (переведена в
+// STATUS_RUNNING), до запуска /spec и /review.
+func BuildStartedMessage(taskName, taskURL string) (text string, blocks []Block) {
+	text = fmt.Sprintf("🔎 Проверка начата: %s — %s", taskName, taskURL)
+
+	blocks = []Block{
+		Header("🔎 Проверка начата"),
+		Section(fmt.Sprintf("*Задача:* <%s|%s>", taskURL, taskName)),
+	}
+	return text, blocks
+}
+
 // BuildReviewMessage формирует Block Kit сообщение о завершённом прогоне.
 // Критичный вердикт визуально отличим от успешного (эмодзи + заголовок).
 func BuildReviewMessage(n ReviewNotification) (text string, blocks []Block) {
@@ -44,6 +57,23 @@ func BuildReviewMessage(n ReviewNotification) (text string, blocks []Block) {
 		Header(fmt.Sprintf("%s Ревью задачи: %s", emoji, verdictLabel)),
 		Section(lines),
 	}
+	return text, blocks
+}
+
+// BuildShortResultMessage формирует короткое сообщение об итоге проверки:
+// задача и куда она перемещена, без разбивки по уровням замечаний — этого
+// достаточно, полный текст ревью уже опубликован комментарием в задаче.
+func BuildShortResultMessage(n ReviewNotification) (text string, blocks []Block) {
+	emoji, _ := verdictPresentation(n.Verdict)
+
+	text = fmt.Sprintf("%s %s: %s → %s — %s", emoji, n.TaskName, n.FromStatus, n.ToStatus, n.TaskURL)
+
+	line := fmt.Sprintf("%s *<%s|%s>*: `%s` → `%s`", emoji, n.TaskURL, n.TaskName, n.FromStatus, n.ToStatus)
+	if n.Assignee != "" {
+		line += fmt.Sprintf(" (исполнитель: %s)", n.Assignee)
+	}
+
+	blocks = []Block{Section(line)}
 	return text, blocks
 }
 

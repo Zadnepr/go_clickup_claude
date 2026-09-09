@@ -117,6 +117,60 @@ func TestAddAssignees_OnlyAdds(t *testing.T) {
 	}
 }
 
+func TestRemoveAssignees_OnlyRemoves(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Assignees struct {
+				Add []int `json:"add"`
+				Rem []int `json:"rem"`
+			} `json:"assignees"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if len(body.Assignees.Rem) != 2 || body.Assignees.Rem[0] != 7 || body.Assignees.Rem[1] != 8 {
+			t.Errorf("unexpected rem list: %+v", body.Assignees.Rem)
+		}
+		if len(body.Assignees.Add) != 0 {
+			t.Errorf("expected empty add list, got: %+v", body.Assignees.Add)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{})
+	})
+
+	if err := c.RemoveAssignees(context.Background(), "123", []int{7, 8}); err != nil {
+		t.Fatalf("RemoveAssignees error: %v", err)
+	}
+}
+
+func TestRemoveAssignees_EmptyListIsNoop(t *testing.T) {
+	called := false
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if err := c.RemoveAssignees(context.Background(), "123", nil); err != nil {
+		t.Fatalf("RemoveAssignees error: %v", err)
+	}
+	if called {
+		t.Fatal("expected no HTTP request for an empty assignee list")
+	}
+}
+
+func TestRemoveTag(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		want := "/task/123/tag/ai"
+		if r.Method != http.MethodDelete || r.URL.Path != want {
+			t.Fatalf("unexpected request: %s %s, want DELETE %s", r.Method, r.URL.Path, want)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{})
+	})
+
+	if err := c.RemoveTag(context.Background(), "123", "ai"); err != nil {
+		t.Fatalf("RemoveTag error: %v", err)
+	}
+}
+
 func TestAddComment_NotifyAllOff(t *testing.T) {
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any

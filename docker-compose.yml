@@ -27,12 +27,31 @@ services:
       - RECONCILE_INTERVAL
       - PORT
       - DB_PATH
+      # SSH-агент хоста форвардится в контейнер (см. volumes ниже) — git
+      # внутри контейнера аутентифицируется теми же ключами, что и на хосте,
+      # сами приватные ключи в контейнер не копируются.
+      - SSH_AUTH_SOCK=/ssh-agent
     volumes:
       - reviewer-data:/data
       # Рабочая копия репозитория: если REPO_URL не задан, смонтируйте свою
       # локальную копию с хоста вместо именованного тома, например:
       #   - /path/to/your/repo:/repo
-      - reviewer-repo:/repo
+      - ../:/repo
+      # Проброс SSH-агента хоста (нужен для git fetch по SSH-remote'ам —
+      # почти все репозитории perfectpanel используют git@github.com:...).
+      # На macOS с Docker Desktop переменная SSH_AUTH_SOCK обычно уже
+      # экспортирована в шелле — просто запускайте `docker compose up`
+      # из обычного терминала. Проверить, что агент видит нужный ключ:
+      # `ssh-add -l`. Приватные ключи в контейнер не копируются.
+      - ${SSH_AUTH_SOCK}:/ssh-agent
+      # ~/.ssh/config — нужен, если у вас настроены алиасы хостов
+      # (например, github-personal для второго GitHub-аккаунта). Алиасы
+      # с `IdentitiesOnly yes` и конкретным IdentityFile работать не будут —
+      # приватный ключ форвардится только через агент, файла на диске нет.
+      # Прогон это не остановит (успеха хотя бы одного репозитория достаточно),
+      # но конкретно такой репозиторий не обновится.
+      - ~/.ssh/config:/home/node/.ssh/config:ro
+      - ~/.ssh/known_hosts:/home/node/.ssh/known_hosts:ro
       # Deploy key для git clone внутри контейнера при заданном REPO_URL:
       # раскомментируйте и укажите путь к приватному ключу на хосте.
       # - ./deploy_key:/home/node/.ssh/id_ed25519:ro

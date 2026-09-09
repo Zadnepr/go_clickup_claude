@@ -114,6 +114,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	mux := httpapi.NewMux(httpapi.Deps{
 		Queue:         q,
+		Trigger:       &manualRunner{cfg: cfg, cuClient: cuClient, queue: q, logger: logger},
 		WebhookSecret: cfg.CUWebhookSecret,
 		Store:         st,
 		RepoPath:      cfg.RepoPath,
@@ -183,16 +184,56 @@ func runReconcileLoop(cfg *config.Config, cuClient *clickup.Client, q *queue.Que
 }
 
 func reconcileOnce(cfg *config.Config, cuClient *clickup.Client, q *queue.Queue, logger *slog.Logger) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	tasks, err := cuClient.ListTasksByTagAndStatus(ctx, cfg.CUListID, cfg.TriggerTag, cfg.StatusTrigger)
-	if err != nil {
+	if _, err := scanAndSubmit(context.Background(), cfg, cuClient, q); err != nil {
 		logger.Error("reconcile: failed to list tasks", "error", err.Error())
 		return
 	}
+}
 
+// scanAndSubmit запрашивает задачи списка с нужным тегом и статусом и
+// ставит в очередь всё, что ещё не обрабатывалось. Используется и сверкой,
+// и ручным запуском через POST /api/run без task_id — это и есть та самая
+// «одна функция постановки в очередь», в которую ведут оба источника.
+func scanAndSubmit(ctx context.Context, cfg *config.Config, cuClient *clickup.Client, q *queue.Queue) ([]string, error) {
+	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	tasks, err := cuClient.ListTasksByTagAndStatus(scanCtx, cfg.CUListID, cfg.TriggerTag, cfg.StatusTrigger)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(tasks) == 0 {
+		slog.Info("сверка: подходящих задач не найдено", "list_id", cfg.CUListID, "tag", cfg.TriggerTag, "status", cfg.StatusTrigger)
+		return nil, nil
+	}
+
+	ids := make([]string, 0, len(tasks))
 	for _, t := range tasks {
 		q.Submit(t.ID)
+		ids = append(ids, t.ID)
 	}
+	return ids, nil
+}
+
+// manualRunner реализует httpapi.ManualRunner: ручной запуск конкретной
+// задачи (если передан task_id) или немедленное пересканирование доски
+// (та же логика, что и у сверки).
+type manualRunner struct {
+	cfg      *config.Config
+	cuClient *clickup.Client
+	queue    *queue.Queue
+	logger   *slog.Logger
+}
+
+func (m *manualRunner) RunNow(ctx context.Context, taskID string) ([]string, error) {
+	if taskID != "" {
+		m.queue.Submit(taskID)
+		return []string{taskID}, nil
+	}
+	ids, err := scanAndSubmit(ctx, m.cfg, m.cuClient, m.queue)
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

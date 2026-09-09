@@ -290,6 +290,33 @@ func (c *Client) AddAssignees(ctx context.Context, taskID string, userIDs []int)
 	return nil
 }
 
+// RemoveAssignees снимает указанных исполнителей с задачи, не трогая
+// остальных.
+func (c *Client) RemoveAssignees(ctx context.Context, taskID string, userIDs []int) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	_, err := c.doRequest(ctx, http.MethodPut, "/task/"+taskID, nil, map[string]any{
+		"assignees": map[string]any{
+			"add": []int{},
+			"rem": userIDs,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("remove assignees %v from task %s: %w", userIDs, taskID, err)
+	}
+	return nil
+}
+
+// RemoveTag снимает тег с задачи.
+func (c *Client) RemoveTag(ctx context.Context, taskID, tagName string) error {
+	_, err := c.doRequest(ctx, http.MethodDelete, "/task/"+taskID+"/tag/"+url.PathEscape(tagName), nil, nil)
+	if err != nil {
+		return fmt.Errorf("remove tag %q from task %s: %w", tagName, taskID, err)
+	}
+	return nil
+}
+
 // AddComment публикует комментарий в задаче. notify_all всегда выключен.
 func (c *Client) AddComment(ctx context.Context, taskID, text string) error {
 	_, err := c.doRequest(ctx, http.MethodPost, "/task/"+taskID+"/comment", nil, map[string]any{

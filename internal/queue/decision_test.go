@@ -10,7 +10,7 @@ import (
 
 func TestDecide_Pass(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnPass: "10"}
-	status, assignees := Decide(review.Verdict{Status: review.StatusPass}, cfg, 999)
+	status, assignees := Decide(review.Verdict{Status: review.StatusPass}, cfg, 999, nil)
 	if status != "done" {
 		t.Errorf("status = %q, want done", status)
 	}
@@ -21,7 +21,7 @@ func TestDecide_Pass(t *testing.T) {
 
 func TestDecide_Pass_NoAssigneeConfigured(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
-	_, assignees := Decide(review.Verdict{Status: review.StatusPass}, cfg, 999)
+	_, assignees := Decide(review.Verdict{Status: review.StatusPass}, cfg, 999, nil)
 	if len(assignees) != 0 {
 		t.Errorf("expected no assignee change on pass, got: %+v", assignees)
 	}
@@ -29,18 +29,26 @@ func TestDecide_Pass_NoAssigneeConfigured(t *testing.T) {
 
 func TestDecide_Fail_UsesConfiguredAssignee(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnFail: "20"}
-	status, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999)
+	status, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, []int{7})
 	if status != "to fix" {
 		t.Errorf("status = %q, want %q", status, "to fix")
 	}
 	if len(assignees) != 1 || assignees[0] != 20 {
-		t.Errorf("assignees = %+v, want [20]", assignees)
+		t.Errorf("configured ASSIGNEE_ON_FAIL should take priority, got: %+v", assignees)
 	}
 }
 
-func TestDecide_Fail_FallsBackToCreator(t *testing.T) {
+func TestDecide_Fail_FallsBackToOriginalAssignees(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
-	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 42)
+	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 42, []int{7, 8})
+	if len(assignees) != 2 || assignees[0] != 7 || assignees[1] != 8 {
+		t.Errorf("expected fallback to original assignees [7 8], got: %+v", assignees)
+	}
+}
+
+func TestDecide_Fail_FallsBackToCreatorWhenNoOriginalAssignees(t *testing.T) {
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
+	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 42, nil)
 	if len(assignees) != 1 || assignees[0] != 42 {
 		t.Errorf("expected fallback to creator id 42, got: %+v", assignees)
 	}
@@ -48,7 +56,7 @@ func TestDecide_Fail_FallsBackToCreator(t *testing.T) {
 
 func TestDecide_Blocked_GoesToFailStatusLikeCriticalFindings(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
-	status, _ := Decide(review.Verdict{Status: review.StatusBlocked}, cfg, 0)
+	status, _ := Decide(review.Verdict{Status: review.StatusBlocked}, cfg, 0, nil)
 	if status != "to fix" {
 		t.Errorf("blocked verdict should map to STATUS_FAIL, got %q", status)
 	}
@@ -56,7 +64,7 @@ func TestDecide_Blocked_GoesToFailStatusLikeCriticalFindings(t *testing.T) {
 
 func TestDecide_EmptyStatusMeansNoTransition(t *testing.T) {
 	cfg := &config.Config{} // STATUS_PASS/STATUS_FAIL not configured
-	status, _ := Decide(review.Verdict{Status: review.StatusPass}, cfg, 0)
+	status, _ := Decide(review.Verdict{Status: review.StatusPass}, cfg, 0, nil)
 	if status != "" {
 		t.Errorf("expected empty target status when not configured, got %q", status)
 	}

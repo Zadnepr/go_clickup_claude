@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -20,11 +21,13 @@ import (
 
 // fakeClickUp — фейковая реализация интерфейса ClickUp для тестов воркера.
 type fakeClickUp struct {
-	mu        sync.Mutex
-	task      *clickup.Task
-	statuses  []string
-	assignees [][]int
-	comments  []string
+	mu               sync.Mutex
+	task             *clickup.Task
+	statuses         []string
+	assignees        [][]int
+	removedAssignees [][]int
+	removedTags      []string
+	comments         []string
 }
 
 func (f *fakeClickUp) GetTask(ctx context.Context, taskID string) (*clickup.Task, error) {
@@ -48,6 +51,20 @@ func (f *fakeClickUp) AddAssignees(ctx context.Context, taskID string, userIDs [
 	return nil
 }
 
+func (f *fakeClickUp) RemoveAssignees(ctx context.Context, taskID string, userIDs []int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedAssignees = append(f.removedAssignees, userIDs)
+	return nil
+}
+
+func (f *fakeClickUp) RemoveTag(ctx context.Context, taskID, tagName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedTags = append(f.removedTags, tagName)
+	return nil
+}
+
 func (f *fakeClickUp) AddComment(ctx context.Context, taskID, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -59,6 +76,7 @@ func (f *fakeClickUp) AddComment(ctx context.Context, taskID, text string) error
 type fakeRunner struct {
 	specErr    error
 	specExists bool
+	specUsage  review.TokenUsage
 	result     review.Result
 	reviewErr  error
 	gitErr     error
@@ -66,8 +84,8 @@ type fakeRunner struct {
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
 
-func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, error) {
-	return "spec-session", f.specErr
+func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, review.TokenUsage, error) {
+	return "spec-session", f.specUsage, f.specErr
 }
 
 func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error) {
@@ -127,7 +145,24 @@ type nil2Writer struct{}
 
 func (nil2Writer) Write(p []byte) (int, error) { return len(p), nil }
 
-func testConfig() *config.Config {
+// repoWithCommands создаёт временный каталог с .claude/commands/{spec,review}.md,
+// чтобы missingCommands не блокировал прогон в тестах, которым это не нужно.
+func repoWithCommands(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	cmdDir := filepath.Join(dir, ".claude", "commands")
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatalf("mkdir commands dir: %v", err)
+	}
+	for _, name := range requiredCommands {
+		if err := os.WriteFile(filepath.Join(cmdDir, name), []byte("# stub"), 0o644); err != nil {
+			t.Fatalf("write stub command %s: %v", name, err)
+		}
+	}
+	return dir
+}
+
+func testConfig(t *testing.T) *config.Config {
 	return &config.Config{
 		CUListID:          "list1",
 		TriggerTag:        "ai",
@@ -138,6 +173,7 @@ func testConfig() *config.Config {
 		AssigneeOnFail:    "20",
 		WorkerConcurrency: 1,
 		ReviewTimeout:     10 * time.Second,
+		RepoPath:          repoWithCommands(t),
 	}
 }
 
@@ -153,7 +189,7 @@ func TestProcessTask_PassVerdict_FullPipeline(t *testing.T) {
 		},
 	}
 
-	deps, _, calls := newTestDeps(t, cu, runner, testConfig())
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 	q.processTask("1")
 
@@ -169,8 +205,8 @@ func TestProcessTask_PassVerdict_FullPipeline(t *testing.T) {
 		t.Fatalf("expected 1 comment, got %d", len(cu.comments))
 	}
 
-	if len(*calls) != 1 {
-		t.Fatalf("expected 1 slack notification, got %d", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 slack notifications (started + finished), got %d", len(*calls))
 	}
 }
 
@@ -185,7 +221,7 @@ func TestProcessTask_FailVerdict_AssignsConfiguredUser(t *testing.T) {
 		},
 	}
 
-	deps, _, _ := newTestDeps(t, cu, runner, testConfig())
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 	q.processTask("2")
 
@@ -200,20 +236,39 @@ func TestProcessTask_FailVerdict_AssignsConfiguredUser(t *testing.T) {
 }
 
 func TestProcessTask_ReviewProcessError_MarksRunFailedAndNotifies(t *testing.T) {
-	task := &clickup.Task{ID: "3", Name: "Task 3", URL: "https://app.clickup.com/t/3", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
+	task := &clickup.Task{
+		ID: "3", Name: "Task 3", URL: "https://app.clickup.com/t/3",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
 		result:    review.Result{Verdict: review.Verdict{Status: review.StatusBlocked}},
 		reviewErr: context.DeadlineExceeded,
 	}
 
-	deps, _, calls := newTestDeps(t, cu, runner, testConfig())
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 	q.processTask("3")
 
-	if len(*calls) != 1 {
-		t.Fatalf("expected 1 slack notification for service error, got %d", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 slack notifications (started + service error), got %d", len(*calls))
 	}
+
+	// Реальный сбой процесса — не результат ревью: статус (кроме перехода
+	// в running в начале), тег и исполнителя трогать нельзя, иначе задача
+	// получит ложный вердикт из-за инфраструктурной проблемы (протухший
+	// токен, таймаут и т.п.), а не реальной проверки кода.
+	cu.mu.Lock()
+	if len(cu.statuses) != 1 || cu.statuses[0] != "checking" {
+		t.Errorf("expected only the running-status transition, got: %+v", cu.statuses)
+	}
+	if len(cu.assignees) != 0 {
+		t.Errorf("expected no assignee change on a process error, got: %+v", cu.assignees)
+	}
+	if len(cu.removedTags) != 0 {
+		t.Errorf("expected trigger tag to stay on a process error, got: %+v", cu.removedTags)
+	}
+	cu.mu.Unlock()
 
 	// Прогон должен быть отмечен как failed и не блокировать повторную постановку.
 	runID, enqueued, err := deps.Store.TryEnqueue(context.Background(), "3")
@@ -231,7 +286,7 @@ func TestProcessTask_NotEligible_SkipsWithoutDedupRecord(t *testing.T) {
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{}
 
-	deps, _, calls := newTestDeps(t, cu, runner, testConfig())
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 	q.processTask("4")
 
@@ -259,13 +314,122 @@ func TestProcessTask_DuplicateEvent_DoesNotProduceSecondRun(t *testing.T) {
 		},
 	}
 
-	deps, _, calls := newTestDeps(t, cu, runner, testConfig())
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 
 	q.processTask("5")
 	q.processTask("5") // повторное событие по той же задаче
 
-	if len(*calls) != 1 {
-		t.Fatalf("expected exactly 1 slack notification despite duplicate event, got %d", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("expected exactly 2 slack notifications (started + finished) despite duplicate event, got %d", len(*calls))
+	}
+}
+
+func TestProcessTask_RemovesAssigneesBeforeCheck(t *testing.T) {
+	task := &clickup.Task{
+		ID: "6", Name: "Task 6", URL: "https://app.clickup.com/t/6",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+		Assignees: []int{7, 8},
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("6")
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.removedAssignees) != 1 || len(cu.removedAssignees[0]) != 2 {
+		t.Fatalf("expected original assignees [7 8] to be removed before the check, got: %+v", cu.removedAssignees)
+	}
+}
+
+func TestProcessTask_Fail_ReassignsOriginalAssigneesWhenNoOverrideConfigured(t *testing.T) {
+	task := &clickup.Task{
+		ID: "7", Name: "Task 7", URL: "https://app.clickup.com/t/7",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+		Assignees: []int{7, 8}, CreatorID: 99,
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:  "плохо\nИТОГ: критичных=1 важных=0 минор=0 статус=fail",
+			Verdict: review.Verdict{Status: review.StatusFail, Critical: 1},
+		},
+	}
+
+	cfg := testConfig(t)
+	cfg.AssigneeOnFail = "" // без явного override — должны вернуться исходные исполнители
+	deps, _, _ := newTestDeps(t, cu, runner, cfg)
+	q := New(deps, 10)
+	q.processTask("7")
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.assignees) != 1 || len(cu.assignees[0]) != 2 || cu.assignees[0][0] != 7 || cu.assignees[0][1] != 8 {
+		t.Errorf("expected original assignees [7 8] to be reassigned on failure, got: %+v", cu.assignees)
+	}
+}
+
+func TestProcessTask_RemovesTriggerTagAfterFinishing(t *testing.T) {
+	task := &clickup.Task{ID: "8", Name: "Task 8", URL: "https://app.clickup.com/t/8", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("8")
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.removedTags) != 1 || cu.removedTags[0] != "ai" {
+		t.Fatalf("expected trigger tag 'ai' to be removed after finishing, got: %+v", cu.removedTags)
+	}
+}
+
+func TestProcessTask_MissingRequiredCommands_AbortsWithoutRunningReview(t *testing.T) {
+	task := &clickup.Task{ID: "9", Name: "Task 9", URL: "https://app.clickup.com/t/9", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{} // не должен быть вызван вовсе
+
+	cfg := testConfig(t)
+	cfg.RepoPath = t.TempDir() // пустой репозиторий, без .claude/commands
+	deps, _, calls := newTestDeps(t, cu, runner, cfg)
+	q := New(deps, 10)
+	q.processTask("9")
+
+	cu.mu.Lock()
+	commentsPosted := len(cu.comments)
+	tagsRemoved := len(cu.removedTags)
+	cu.mu.Unlock()
+
+	if commentsPosted != 0 {
+		t.Errorf("expected no comment when required commands are missing, got %d", commentsPosted)
+	}
+	if tagsRemoved != 0 {
+		t.Errorf("expected trigger tag to stay when the run never reached a real verdict, got %d removals", tagsRemoved)
+	}
+	// started + служебная ошибка.
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 slack notifications (started + service error), got %d", len(*calls))
+	}
+
+	// failed-прогон не должен блокировать повторную постановку.
+	if _, enqueued, err := deps.Store.TryEnqueue(context.Background(), "9"); err != nil || !enqueued {
+		t.Fatalf("expected task to be re-enqueueable after missing-commands failure: enqueued=%v err=%v", enqueued, err)
 	}
 }

@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
 type fakeSubmitter struct {
@@ -26,9 +28,41 @@ func (f *fakeSubmitter) Submit(taskID string) bool {
 	return true
 }
 
-type fakePinger struct{ err error }
+type fakePinger struct {
+	err        error
+	active     []store.Run
+	stats      store.Stats
+	statsErr   error
+	statsSince time.Time
+}
 
 func (f *fakePinger) Ping(ctx context.Context) error { return f.err }
+
+func (f *fakePinger) ListActive(ctx context.Context) ([]store.Run, error) {
+	return f.active, f.err
+}
+
+func (f *fakePinger) Stats(ctx context.Context, since time.Time) (store.Stats, error) {
+	f.statsSince = since
+	if f.statsErr != nil {
+		return store.Stats{}, f.statsErr
+	}
+	return f.stats, nil
+}
+
+type fakeManualRunner struct {
+	submitted []string
+	taskIDArg string
+	err       error
+}
+
+func (f *fakeManualRunner) RunNow(ctx context.Context, taskID string) ([]string, error) {
+	f.taskIDArg = taskID
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.submitted, nil
+}
 
 func sign(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -219,6 +253,127 @@ func TestReadyz_RepoMissing_Returns503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestRun_WithTaskID_SubmitsAndReturns202(t *testing.T) {
+	trigger := &fakeManualRunner{submitted: []string{"123"}}
+	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewReader([]byte(`{"task_id":"123"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body: %s", rec.Code, rec.Body.String())
+	}
+	if trigger.taskIDArg != "123" {
+		t.Errorf("expected RunNow called with task_id=123, got %q", trigger.taskIDArg)
+	}
+}
+
+func TestRun_WithoutBody_TriggersFullScan(t *testing.T) {
+	trigger := &fakeManualRunner{submitted: []string{"1", "2", "3"}}
+	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/run", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body: %s", rec.Code, rec.Body.String())
+	}
+	if trigger.taskIDArg != "" {
+		t.Errorf("expected RunNow called with empty task_id for a full scan, got %q", trigger.taskIDArg)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"1"`)) {
+		t.Errorf("expected submitted task ids in response, got: %s", rec.Body.String())
+	}
+}
+
+func TestRun_TriggerError_Returns502(t *testing.T) {
+	trigger := &fakeManualRunner{err: errors.New("clickup down")}
+	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/run", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
+func TestStatus_ReturnsActiveRuns(t *testing.T) {
+	active := []store.Run{{ID: 1, TaskID: "123", Status: store.StatusRunning}}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: &fakePinger{active: active}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"123"`)) {
+		t.Errorf("expected active task id in response, got: %s", rec.Body.String())
+	}
+}
+
+func TestStats_DefaultWindowIsAll(t *testing.T) {
+	fake := &fakePinger{stats: store.Stats{TotalRuns: 5, ByStatus: map[string]int{"done": 5}}}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: fake, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	if !fake.statsSince.IsZero() {
+		t.Errorf("expected zero 'since' for the default 'all' window, got %v", fake.statsSince)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"total_runs":5`)) {
+		t.Errorf("expected total_runs in response, got: %s", rec.Body.String())
+	}
+}
+
+func TestStats_HourWindow_PassesRecentSince(t *testing.T) {
+	fake := &fakePinger{}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: fake, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	before := time.Now().Add(-time.Hour)
+	req := httptest.NewRequest(http.MethodGet, "/api/stats?window=hour", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	after := time.Now().Add(-time.Hour)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if fake.statsSince.Before(before.Add(-time.Second)) || fake.statsSince.After(after.Add(time.Second)) {
+		t.Errorf("expected since ~1h ago, got %v (window [%v, %v])", fake.statsSince, before, after)
+	}
+}
+
+func TestStats_StoreError_Returns500(t *testing.T) {
+	fake := &fakePinger{statsErr: errors.New("db error")}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: fake, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }
 
