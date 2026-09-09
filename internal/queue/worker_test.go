@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -553,4 +554,58 @@ func TestQueue_SubmitResume_BypassesEligibilityThroughRealDispatch(t *testing.T)
 	}
 
 	q.Shutdown(time.Second)
+}
+
+func TestStripVerdictLine(t *testing.T) {
+	output := "## PR 1 — задача\n\n### Замечания\n\n1. [Критично] foo.php:1 — bug.\n\nИТОГ: критичных=1 важных=0 минор=0 статус=fail"
+	raw := "ИТОГ: критичных=1 важных=0 минор=0 статус=fail"
+
+	got := stripVerdictLine(output, raw)
+	if strings.Contains(got, "ИТОГ:") {
+		t.Errorf("expected ИТОГ line to be stripped, got: %q", got)
+	}
+	if !strings.Contains(got, "1. [Критично] foo.php:1 — bug.") {
+		t.Errorf("expected findings to remain, got: %q", got)
+	}
+}
+
+func TestStripVerdictLine_EmptyRawIsNoop(t *testing.T) {
+	output := "some text without a verdict line"
+	if got := stripVerdictLine(output, ""); got != output {
+		t.Errorf("expected output unchanged when raw is empty, got: %q", got)
+	}
+}
+
+func TestProcessTask_CommentExcludesSessionLineAndVerdictLine(t *testing.T) {
+	task := &clickup.Task{ID: "14", Name: "Task 14", URL: "https://app.clickup.com/t/14", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
+	cu := &fakeClickUp{task: task}
+	raw := "ИТОГ: критичных=0 важных=0 минор=0 статус=pass"
+	runner := &fakeRunner{
+		specExists: true,
+		result: review.Result{
+			Output:    "### Замечания\n\nЗамечаний нет.\n\n" + raw,
+			SessionID: "sess-xyz",
+			Verdict:   review.Verdict{Status: review.StatusPass, Raw: raw},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("14")
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(cu.comments))
+	}
+	comment := cu.comments[0]
+	if strings.Contains(comment, "Сессия") || strings.Contains(comment, "sess-xyz") {
+		t.Errorf("expected no session line in the comment, got: %q", comment)
+	}
+	if strings.Contains(comment, "ИТОГ:") {
+		t.Errorf("expected no ИТОГ line in the comment, got: %q", comment)
+	}
+	if !strings.Contains(comment, "Замечаний нет.") {
+		t.Errorf("expected findings text to remain, got: %q", comment)
+	}
 }

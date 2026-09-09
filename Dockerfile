@@ -21,6 +21,13 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code @krodak/clickup-cli \
     && npm cache clean --force
 
+# notion-cli — не публичный npm-пакет, а внутренний клиент приватного Notion
+# API; его код с уже установленными зависимостями монтируется томом в
+# /opt/notion-cli (см. docker-compose.yml), здесь только тонкая обёртка,
+# делающая команду доступной в PATH.
+RUN printf '#!/bin/sh\nexec node /opt/notion-cli/bin/notion-cli.js "$@"\n' > /usr/local/bin/notion-cli \
+    && chmod +x /usr/local/bin/notion-cli
+
 COPY --from=build /out/reviewer /usr/local/bin/reviewer
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

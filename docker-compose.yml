@@ -62,6 +62,14 @@ services:
       # Deploy key для git clone внутри контейнера при заданном REPO_URL:
       # раскомментируйте и укажите путь к приватному ключу на хосте.
       # - ./deploy_key:/home/node/.ssh/id_ed25519:ro
+      # notion-cli — внутренний клиент приватного Notion API, не публичный
+      # npm-пакет. Код с уже установленными зависимостями монтируется
+      # как есть (без обёртки — та уже в образе, см. Dockerfile). Конфиг
+      # содержит сохранённую сессию/токен — тот же принцип, что и SSH-агент:
+      # используются реальные креды хоста, ничего не копируется в образ.
+      - ../cli/notion-private-api-mcp:/opt/notion-cli:ro
+      - ~/.config/notion-cli:/home/node/.config/notion-cli:ro
+      - ~/.cache/notion-cli:/home/node/.cache/notion-cli
 
 volumes:
   reviewer-data:

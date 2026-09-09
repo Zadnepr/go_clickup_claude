@@ -235,8 +235,9 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		log.Warn("review output had no parsable ИТОГ line, treating as blocked")
 	}
 
-	if strings.TrimSpace(result.Output) != "" {
-		q.postComment(ctx, log, task.ID, result.SessionID, result.Output)
+	commentText := strings.TrimSpace(stripVerdictLine(result.Output, verdict.Raw))
+	if commentText != "" {
+		q.postComment(ctx, log, task.ID, commentText)
 	}
 
 	// Реальный сбой процесса (не смог запуститься, упал, protухший токен,
@@ -305,19 +306,31 @@ func storeUsage(u review.TokenUsage) store.Usage {
 
 // postComment публикует полный текст ревью, при необходимости разбивая его
 // на несколько последовательных комментариев по границам разделов.
-func (q *Queue) postComment(ctx context.Context, log *slog.Logger, taskID, sessionID, output string) {
-	full := output
-	if sessionID != "" {
-		full = fmt.Sprintf("Сессия ревью: `%s`\n\n%s", sessionID, output)
-	}
-
-	chunks := SplitComment(full, maxCommentLen)
+func (q *Queue) postComment(ctx context.Context, log *slog.Logger, taskID, output string) {
+	chunks := SplitComment(output, maxCommentLen)
 	for i, chunk := range chunks {
 		if err := q.deps.ClickUp.AddComment(ctx, taskID, chunk); err != nil {
 			log.Error("failed to post review comment", "part", i+1, "of", len(chunks), "error", err.Error())
 			return
 		}
 	}
+}
+
+// stripVerdictLine убирает служебную строку "ИТОГ: ..." из текста, который
+// публикуется комментарием в задаче — читателю в ClickUp она не нужна,
+// это чисто машинный контракт для Go. Это единственное разрешённое
+// исключение из правила "Go не разбирает текст ревью": строка уже была
+// найдена регулярным выражением при разборе вердикта (verdict.Raw),
+// здесь просто вырезается её точное вхождение, без анализа остального текста.
+func stripVerdictLine(output, raw string) string {
+	if raw == "" {
+		return output
+	}
+	idx := strings.LastIndex(output, raw)
+	if idx == -1 {
+		return output
+	}
+	return strings.TrimRight(output[:idx], "\n \t")
 }
 
 // notifyReviewResult шлёт в Slack и в консоль короткое сообщение о том, что
