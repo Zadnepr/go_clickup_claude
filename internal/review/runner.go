@@ -198,9 +198,14 @@ func (r *Runner) run(ctx context.Context, prompt string) (claudeJSONResult, stri
 		binary = "claude"
 	}
 
+	// Список — объединение allowed-tools обеих команд (.claude/commands/spec.md
+	// и review.md): /spec нужен Write, чтобы сохранить файл ТЗ, обеим нужен
+	// Bash(notion-cli:*) для сбора ТЗ из Notion. Без этого claude отрабатывает
+	// сессию до конца (is_error=false), просто не сохраняя файл — что выглядит
+	// как "всё прошло успешно", хотя по факту команда была лишена инструмента.
 	cmd := exec.CommandContext(ctx, binary, "-p", prompt,
 		"--output-format", "json",
-		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Read", "Grep", "Glob")
+		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Bash(notion-cli:*)", "Read", "Grep", "Glob", "Write")
 	cmd.Dir = r.RepoPath
 	// os.Environ() дополняется, а не заменяется: иначе claude не увидит
 	// CLAUDE_CODE_OAUTH_TOKEN и упадёт на авторизации.
