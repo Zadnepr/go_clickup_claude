@@ -125,7 +125,7 @@ func (q *Queue) processTask(taskID string) {
 		return
 	}
 
-	runID, enqueued, err := q.deps.Store.TryEnqueue(ctx, taskID)
+	runID, enqueued, err := q.deps.Store.ReopenOrEnqueue(ctx, taskID)
 	if err != nil {
 		log.Error("failed to record run in store", "error", err.Error())
 		return
@@ -165,7 +165,7 @@ func (q *Queue) resumeTask(taskID string) {
 		return
 	}
 
-	runID, enqueued, err := q.deps.Store.TryEnqueue(ctx, taskID)
+	runID, enqueued, err := q.deps.Store.ReopenOrEnqueue(ctx, taskID)
 	if err != nil {
 		log.Error("failed to record resumed run in store", "error", err.Error())
 		return
@@ -179,43 +179,64 @@ func (q *Queue) resumeTask(taskID string) {
 	q.runReview(ctx, log, task, runID)
 }
 
+// runReview прогоняет одну задачу через полный цикл поэтапно (см. stage.go):
+// setup → commands_check → git_fetch → spec → review → decide → comment.
+// Каждый этап логируется в run_stages (Store.StartStage/FinishStage/
+// FailStage) — если runID уже переоткрыт после паузы/обрыва процесса (см.
+// Store.ReopenOrEnqueue), уже пройденные этапы берутся из БД, а не
+// выполняются заново: /spec и /review — самые дорогие вызовы во всём цикле,
+// и именно их результат («результат /spec сохранялся в табличку») не нужно
+// терять при возобновлении.
 func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64) {
 	cfg := q.deps.Cfg
 
-	if cfg.StatusRunning != "" {
-		if err := q.deps.ClickUp.SetStatus(ctx, task.ID, cfg.StatusRunning); err != nil {
-			log.Error("failed to move task to running status",
-				"attempted_status", cfg.StatusRunning,
-				"available_statuses", task.AvailableStatuses,
-				"error", err.Error())
-		}
-	}
 	if err := q.deps.Store.MarkRunning(ctx, runID); err != nil {
 		log.Error("failed to mark run as running", "error", err.Error())
 	}
 
-	// Снимаем текущих исполнителей на время проверки — запоминаем их, чтобы
-	// при провале вернуть работу тому же человеку (или создателю, если
-	// исполнителей не было). Успех переназначает задачу отдельному ревьюеру
-	// (ASSIGNEE_ON_PASS), поэтому снятые здесь люди для успешного пути не нужны.
-	originalAssignees := append([]int(nil), task.Assignees...)
-	if len(originalAssignees) > 0 {
-		if err := q.deps.ClickUp.RemoveAssignees(ctx, task.ID, originalAssignees); err != nil {
-			log.Error("failed to remove assignees before check", "assignees", originalAssignees, "error", err.Error())
+	setup, _, _ := stageRun(ctx, q, log, runID, stageSetup, func() (setupData, error) {
+		if cfg.StatusRunning != "" {
+			if err := q.deps.ClickUp.SetStatus(ctx, task.ID, cfg.StatusRunning); err != nil {
+				log.Error("failed to move task to running status",
+					"attempted_status", cfg.StatusRunning,
+					"available_statuses", task.AvailableStatuses,
+					"error", err.Error())
+			}
 		}
-	}
 
-	q.notifyStarted(ctx, log, task)
+		// Снимаем текущих исполнителей на время проверки — запоминаем их в
+		// data этого этапа, чтобы при провале вернуть работу тому же
+		// человеку (или создателю, если исполнителей не было). Критично для
+		// возобновления: свежий GetTask после снятия вернёт уже пустой
+		// список — источником истины здесь может быть только сохранённый
+		// результат этого этапа, а не текущее состояние карточки.
+		original := append([]int(nil), task.Assignees...)
+		if len(original) > 0 {
+			if err := q.deps.ClickUp.RemoveAssignees(ctx, task.ID, original); err != nil {
+				log.Error("failed to remove assignees before check", "assignees", original, "error", err.Error())
+			}
+		}
 
-	if missing := missingCommands(cfg.RepoPath); len(missing) > 0 {
-		errMsg := fmt.Sprintf("не найдены обязательные команды: %s", strings.Join(missing, ", "))
-		log.Error("required slash commands are missing, aborting run", "missing", missing)
-		q.notifyServiceError(ctx, log, task, errMsg)
-		q.markFailed(ctx, log, runID, "", errMsg, review.TokenUsage{})
+		q.notifyStarted(ctx, log, task)
+		return setupData{OriginalAssignees: original}, nil
+	})
+	originalAssignees := setup.OriginalAssignees
+
+	if _, _, err := stageRun(ctx, q, log, runID, stageCommandsCheck, func() (struct{}, error) {
+		if missing := missingCommands(cfg.RepoPath); len(missing) > 0 {
+			return struct{}{}, fmt.Errorf("не найдены обязательные команды: %s", strings.Join(missing, ", "))
+		}
+		return struct{}{}, nil
+	}); err != nil {
+		log.Error("required slash commands are missing, aborting run", "error", err.Error())
+		q.notifyServiceError(ctx, log, task, err.Error())
+		q.markFailed(ctx, log, runID, "", err.Error(), review.TokenUsage{})
 		return
 	}
 
-	if err := q.deps.Runner.GitFetch(ctx); err != nil {
+	if _, _, err := stageRun(ctx, q, log, runID, stageGitFetch, func() (struct{}, error) {
+		return struct{}{}, q.deps.Runner.GitFetch(ctx)
+	}); err != nil {
 		errMsg := "git fetch failed: " + err.Error()
 		log.Error("git fetch failed, aborting run", "error", err.Error())
 		q.notifyServiceError(ctx, log, task, errMsg)
@@ -223,43 +244,62 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		return
 	}
 
-	specSessionID, specUsage, err := q.deps.Runner.RunSpec(ctx, task.URL)
-	if errors.Is(err, review.ErrUsageLimit) {
-		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, specSessionID, err, specUsage)
-		return
-	}
-	if err != nil {
-		log.Warn("/spec run failed, falling back to a single task link for /review",
-			"error", err.Error(), "spec_session_id", specSessionID)
-	}
-
-	specPath := ""
-	for _, id := range specFileCandidateIDs(task) {
-		if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(id)); statErr == nil {
-			specPath = filepath.Join("specs", id+".md")
-			break
+	spec, _, specErr := stageRun(ctx, q, log, runID, stageSpec, func() (specStageData, error) {
+		sessionID, usage, err := q.deps.Runner.RunSpec(ctx, task.URL)
+		if err != nil {
+			return specStageData{SessionID: sessionID, Usage: usage}, err
 		}
-	}
-	if specPath == "" {
-		log.Warn("/spec did not produce a spec file, running /review with the task link only")
-	}
 
-	result, reviewErr := q.deps.Runner.RunReview(ctx, task.URL, specPath)
-	totalUsage := specUsage.Add(result.Usage)
-	if errors.Is(reviewErr, review.ErrUsageLimit) {
-		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, result.SessionID, reviewErr, totalUsage)
+		specPath := ""
+		for _, id := range specFileCandidateIDs(task) {
+			if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(id)); statErr == nil {
+				specPath = filepath.Join("specs", id+".md")
+				break
+			}
+		}
+		if specPath == "" {
+			log.Warn("/spec did not produce a spec file, running /review with the task link only")
+		}
+		return specStageData{SessionID: sessionID, SpecPath: specPath, Usage: usage}, nil
+	})
+	if errors.Is(specErr, review.ErrUsageLimit) {
+		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, spec.SessionID, specErr, spec.Usage)
 		return
 	}
-	verdict := result.Verdict
+	if specErr != nil {
+		log.Warn("/spec run failed, falling back to a single task link for /review",
+			"error", specErr.Error(), "spec_session_id", spec.SessionID)
+	}
+
+	reviewData, _, reviewErr := stageRun(ctx, q, log, runID, stageReview, func() (reviewStageData, error) {
+		result, err := q.deps.Runner.RunReview(ctx, task.URL, spec.SpecPath)
+		return reviewStageData{SessionID: result.SessionID, Output: result.Output, Stderr: result.Stderr, Usage: result.Usage}, err
+	})
+	totalUsage := spec.Usage.Add(reviewData.Usage)
+	if errors.Is(reviewErr, review.ErrUsageLimit) {
+		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, reviewData.SessionID, reviewErr, totalUsage)
+		return
+	}
+
+	// Вердикт не хранится отдельным полем — восстанавливается из Output
+	// чистой функцией ParseVerdict, одинаково что для свежего прогона, что
+	// для взятого из run_stages при возобновлении.
+	verdict := review.ParseVerdict(reviewData.Output)
 	if reviewErr != nil {
-		log.Error("/review run failed", "error", reviewErr.Error(), "stderr", truncateForLog(result.Stderr))
+		log.Error("/review run failed", "error", reviewErr.Error(), "stderr", truncateForLog(reviewData.Stderr))
 	} else if verdict.Raw == "" {
 		log.Warn("review output had no parsable ИТОГ line, treating as blocked")
 	}
 
-	commentText := strings.TrimSpace(stripVerdictLine(result.Output, verdict.Raw))
+	commentText := strings.TrimSpace(stripVerdictLine(reviewData.Output, verdict.Raw))
 	if commentText != "" {
-		q.postComment(ctx, log, task.ID, commentText)
+		// Комментарий — единственный этап без данных для восстановления:
+		// важен сам факт «уже опубликован», иначе возобновление продублирует
+		// его в задаче, а ClickUp такие дубли не схлопывает.
+		stageRun(ctx, q, log, runID, stageComment, func() (struct{}, error) {
+			q.postComment(ctx, log, task.ID, commentText)
+			return struct{}{}, nil
+		})
 	}
 
 	// Реальный сбой процесса (не смог запуститься, упал, protухший токен,
@@ -272,42 +312,47 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	var targetStatus string
 	var assigneeIDs []int
 	if reviewErr == nil {
-		targetStatus, assigneeIDs = Decide(verdict, cfg, task.CreatorID, originalAssignees)
+		decide, _, _ := stageRun(ctx, q, log, runID, stageDecide, func() (decideStageData, error) {
+			ts, ids := Decide(verdict, cfg, task.CreatorID, originalAssignees)
 
-		if targetStatus != "" {
-			if err := q.deps.ClickUp.SetStatus(ctx, task.ID, targetStatus); err != nil {
-				log.Error("failed to move task to target status",
-					"attempted_status", targetStatus,
-					"available_statuses", task.AvailableStatuses,
-					"error", err.Error())
+			if ts != "" {
+				if err := q.deps.ClickUp.SetStatus(ctx, task.ID, ts); err != nil {
+					log.Error("failed to move task to target status",
+						"attempted_status", ts,
+						"available_statuses", task.AvailableStatuses,
+						"error", err.Error())
+				}
 			}
-		}
 
-		if len(assigneeIDs) > 0 {
-			if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, assigneeIDs); err != nil {
-				log.Error("failed to add assignees", "assignees", assigneeIDs, "error", err.Error())
+			if len(ids) > 0 {
+				if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, ids); err != nil {
+					log.Error("failed to add assignees", "assignees", ids, "error", err.Error())
+				}
 			}
-		}
 
-		if cfg.TriggerTag != "" {
-			if err := q.deps.ClickUp.RemoveTag(ctx, task.ID, cfg.TriggerTag); err != nil {
-				log.Error("failed to remove trigger tag", "tag", cfg.TriggerTag, "error", err.Error())
+			if cfg.TriggerTag != "" {
+				if err := q.deps.ClickUp.RemoveTag(ctx, task.ID, cfg.TriggerTag); err != nil {
+					log.Error("failed to remove trigger tag", "tag", cfg.TriggerTag, "error", err.Error())
+				}
 			}
-		}
+			return decideStageData{TargetStatus: ts, AssigneeIDs: ids}, nil
+		})
+		targetStatus = decide.TargetStatus
+		assigneeIDs = decide.AssigneeIDs
 	}
 
-	q.notifyReviewResult(ctx, log, task, verdict, cfg.StatusRunning, targetStatus, assigneeIDs, result.SessionID, reviewErr)
+	q.notifyReviewResult(ctx, log, task, verdict, cfg.StatusRunning, targetStatus, assigneeIDs, reviewData.SessionID, reviewErr)
 
 	if reviewErr != nil {
 		errMsg := reviewErr.Error()
-		if result.Stderr != "" {
-			errMsg += "; stderr: " + truncateForLog(result.Stderr)
+		if reviewData.Stderr != "" {
+			errMsg += "; stderr: " + truncateForLog(reviewData.Stderr)
 		}
-		q.markFailed(ctx, log, runID, result.SessionID, errMsg, totalUsage)
+		q.markFailed(ctx, log, runID, reviewData.SessionID, errMsg, totalUsage)
 		return
 	}
 
-	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, result.SessionID, storeUsage(totalUsage)); err != nil {
+	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, reviewData.SessionID, storeUsage(totalUsage)); err != nil {
 		log.Error("failed to mark run done", "error", err.Error())
 	}
 }

@@ -85,11 +85,13 @@ type fakeRunner struct {
 	gitErr          error
 	gotSpecPath     string // specPath, с которым реально вызвали RunReview
 	reviewCalled    bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
+	specCalled      bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
 }
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
 
 func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, review.TokenUsage, error) {
+	f.specCalled = true
 	return "spec-session", f.specUsage, f.specErr
 }
 
@@ -621,6 +623,129 @@ func TestResumeTask_AlreadyDone_SkipsWithoutReprocessing(t *testing.T) {
 
 	if len(*calls) != 0 {
 		t.Fatalf("expected no reprocessing for a task that already has a done run, got %d slack calls", len(*calls))
+	}
+}
+
+func TestResumeTask_ReusesCompletedSpecStage_DoesNotCallRunSpecAgain(t *testing.T) {
+	task := &clickup.Task{
+		ID: "20", Name: "Task 20", URL: "https://app.clickup.com/t/20",
+		ListID: "list1", Tags: []string{"ai"}, Status: "checking",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specExistsForID: "should-not-be-checked-again",
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	ctx := context.Background()
+	runID := mustEnqueue(t, deps, "20")
+	if err := deps.Store.MarkRunning(ctx, runID); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	mustFinishStage(t, deps, runID, "setup", setupData{})
+	mustFinishStage(t, deps, runID, "spec", specStageData{
+		SessionID: "cached-spec-session",
+		SpecPath:  "specs/cached.md",
+		Usage:     review.TokenUsage{InputTokens: 10, OutputTokens: 5, CostUSD: 0.01},
+	})
+	// Прогон "прервался" сразу после /spec — сервис перезапустился.
+	if _, err := deps.Store.RecoverFromRestart(ctx); err != nil {
+		t.Fatalf("RecoverFromRestart error: %v", err)
+	}
+
+	q := New(deps, 10)
+	q.resumeTask("20")
+
+	if runner.specCalled {
+		t.Error("expected /spec not to run again for a stage already marked done")
+	}
+	if runner.gotSpecPath != "specs/cached.md" {
+		t.Errorf("expected /review to use the cached spec path, got %q", runner.gotSpecPath)
+	}
+
+	run, err := deps.Store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.InputTokens != 10 || run.OutputTokens != 5 {
+		t.Errorf("expected cached /spec usage to be included in the total, got: %+v", run)
+	}
+}
+
+func TestResumeTask_ReusesCompletedReviewStage_DoesNotRepostComment(t *testing.T) {
+	task := &clickup.Task{
+		ID: "21", Name: "Task 21", URL: "https://app.clickup.com/t/21",
+		ListID: "list1", Tags: []string{"ai"}, Status: "checking",
+	}
+	cu := &fakeClickUp{task: task}
+	// Если бы /review реально вызвалась заново, вердикт был бы другим —
+	// тест это заметит через несовпадение целевого статуса.
+	runner := &fakeRunner{
+		reviewErr: fmt.Errorf("must not be called: stage already done"),
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	ctx := context.Background()
+	runID := mustEnqueue(t, deps, "21")
+	if err := deps.Store.MarkRunning(ctx, runID); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	mustFinishStage(t, deps, runID, "setup", setupData{})
+	mustFinishStage(t, deps, runID, "commands_check", struct{}{})
+	mustFinishStage(t, deps, runID, "git_fetch", struct{}{})
+	mustFinishStage(t, deps, runID, "spec", specStageData{SessionID: "spec-sess"})
+	mustFinishStage(t, deps, runID, "review", reviewStageData{
+		SessionID: "cached-review-session",
+		Output:    "Всё отлично.\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+	})
+	mustFinishStage(t, deps, runID, "comment", struct{}{})
+	// Прогон "прервался" после публикации комментария, до перевода в колонку.
+	if _, err := deps.Store.RecoverFromRestart(ctx); err != nil {
+		t.Fatalf("RecoverFromRestart error: %v", err)
+	}
+
+	q := New(deps, 10)
+	q.resumeTask("21")
+
+	if runner.reviewCalled {
+		t.Error("expected /review not to run again for a stage already marked done")
+	}
+	cu.mu.Lock()
+	if len(cu.comments) != 0 {
+		t.Errorf("expected the comment stage to be skipped (no duplicate comment), got: %+v", cu.comments)
+	}
+	if len(cu.statuses) != 1 || cu.statuses[0] != "done" {
+		t.Errorf("expected the task to still reach the decide stage and move to STATUS_PASS, got: %+v", cu.statuses)
+	}
+	cu.mu.Unlock()
+
+	run, err := deps.Store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != store.StatusDone || run.Verdict != "pass" {
+		t.Errorf("expected the run to finish done/pass using the cached review, got: %+v", run)
+	}
+	if len(*calls) == 0 {
+		t.Error("expected a slack notification for the finished review")
+	}
+}
+
+func mustFinishStage(t *testing.T, deps Deps, runID int64, stage string, data any) {
+	t.Helper()
+	if err := deps.Store.StartStage(context.Background(), runID, stage); err != nil {
+		t.Fatalf("StartStage(%s) error: %v", stage, err)
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal stage data for %s: %v", stage, err)
+	}
+	if err := deps.Store.FinishStage(context.Background(), runID, stage, raw); err != nil {
+		t.Fatalf("FinishStage(%s) error: %v", stage, err)
 	}
 }
 

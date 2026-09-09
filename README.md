@@ -262,6 +262,31 @@ rate limit подписки или API) — это не результат ре�
 ключевым фразам вроде "usage limit"/"rate limit"/"usage credit" в тексте
 ответа или stderr процесса.
 
+## Подключение к базе данных
+
+Состояние (таблицы `runs` и `run_stages`, см. следующий раздел) хранится в
+SQLite-файле `DB_PATH` (по умолчанию `/data/state.db`). Том `/data`
+смонтирован с хоста в `./data` (`docker-compose.yml`) — файл лежит прямо
+в `go_claude_agent/data/state.db` и открывается напрямую, без остановки
+контейнера:
+
+```bash
+sqlite3 ./data/state.db          # локальный sqlite3 (есть на macOS из коробки)
+sqlite3 ./data/state.db ".tables"
+sqlite3 -header -column ./data/state.db "SELECT * FROM runs ORDER BY id DESC LIMIT 10;"
+```
+
+GUI-клиенты (DB Browser for SQLite, TablePlus и т.п.) подключаются к тому же
+пути как к обычному SQLite-файлу. Внутри контейнера тот же файл доступен
+через `sqlite3` (пакет есть в образе): `docker compose exec reviewer sqlite3 /data/state.db`.
+
+**До этого изменения** (или если у вас старый том `reviewer-data`) файл лежал
+в именованном Docker-томе, который на macOS Docker Desktop живёт внутри
+Linux-VM и не виден напрямую с хоста — тогда единственный способ дотянуться
+до файла: `docker compose exec reviewer cat /data/state.db > /tmp/state.db`
+(обычный `docker cp`/`docker compose cp` может падать на этом хосте из-за
+пробрасываемого сокета SSH-агента — `cat` через `exec` работает всегда).
+
 ## Переменные окружения
 
 Полный список — в [.env.example](.env.example) и в исходном ТЗ

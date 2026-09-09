@@ -145,23 +145,25 @@ func TestRecoverFromRestart(t *testing.T) {
 		t.Fatalf("MarkRunning error: %v", err)
 	}
 
-	taskIDs, err := s.RecoverFromRestart(ctx)
+	recovered, err := s.RecoverFromRestart(ctx)
 	if err != nil {
 		t.Fatalf("RecoverFromRestart error: %v", err)
 	}
-	if len(taskIDs) != 1 || taskIDs[0] != "task-4" {
-		t.Fatalf("expected [task-4] recovered, got %+v", taskIDs)
+	if len(recovered) != 1 || recovered[0].TaskID != "task-4" || recovered[0].RunID != id {
+		t.Fatalf("expected [{RunID:%d TaskID:task-4}] recovered, got %+v", id, recovered)
 	}
 
 	run, err := s.GetRun(ctx, id)
 	if err != nil {
 		t.Fatalf("GetRun error: %v", err)
 	}
-	if run.Status != StatusFailed {
-		t.Errorf("run status = %q, want %q", run.Status, StatusFailed)
+	if run.Status != StatusInterrupted {
+		t.Errorf("run status = %q, want %q", run.Status, StatusInterrupted)
 	}
 
-	// После восстановления задача должна снова браться в работу.
+	// Interrupted — возобновляемый статус: ReopenOrEnqueue должен
+	// переоткрыть именно этот run_id, а не создать новый (см.
+	// TestReopenOrEnqueue_ReopensInterruptedRun).
 	if _, ok, err := s.TryEnqueue(ctx, "task-4"); err != nil || !ok {
 		t.Fatalf("expected enqueue to succeed after restart recovery: ok=%v err=%v", ok, err)
 	}
@@ -181,16 +183,16 @@ func TestRecoverFromRestart_MultipleRunningTasks(t *testing.T) {
 		}
 	}
 
-	taskIDs, err := s.RecoverFromRestart(ctx)
+	recovered, err := s.RecoverFromRestart(ctx)
 	if err != nil {
 		t.Fatalf("RecoverFromRestart error: %v", err)
 	}
 	got := map[string]bool{}
-	for _, id := range taskIDs {
-		got[id] = true
+	for _, r := range recovered {
+		got[r.TaskID] = true
 	}
-	if len(taskIDs) != 2 || !got["task-a"] || !got["task-b"] {
-		t.Fatalf("expected [task-a task-b] recovered, got %+v", taskIDs)
+	if len(recovered) != 2 || !got["task-a"] || !got["task-b"] {
+		t.Fatalf("expected [task-a task-b] recovered, got %+v", recovered)
 	}
 }
 
@@ -295,6 +297,188 @@ func TestStats_ExcludesRunsBeforeSince(t *testing.T) {
 	}
 	if stats.TotalRuns != 0 {
 		t.Errorf("expected 0 runs when since is in the future, got %d", stats.TotalRuns)
+	}
+}
+
+func TestReopenOrEnqueue_NoExistingRun_BehavesLikeTryEnqueue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, ok, err := s.ReopenOrEnqueue(ctx, "task-fresh")
+	if err != nil || !ok {
+		t.Fatalf("ReopenOrEnqueue error: %v ok=%v", err, ok)
+	}
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != StatusQueued {
+		t.Errorf("status = %q, want %q", run.Status, StatusQueued)
+	}
+}
+
+func TestReopenOrEnqueue_ReopensInterruptedRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-interrupted")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if err := s.MarkRunning(ctx, id); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	if _, err := s.RecoverFromRestart(ctx); err != nil {
+		t.Fatalf("RecoverFromRestart error: %v", err)
+	}
+
+	// Этап, пройденный до обрыва — должен пережить переоткрытие того же run_id.
+	if err := s.StartStage(ctx, id, "spec"); err != nil {
+		t.Fatalf("StartStage error: %v", err)
+	}
+	if err := s.FinishStage(ctx, id, "spec", []byte(`{"session_id":"s1"}`)); err != nil {
+		t.Fatalf("FinishStage error: %v", err)
+	}
+
+	reopenedID, ok, err := s.ReopenOrEnqueue(ctx, "task-interrupted")
+	if err != nil || !ok {
+		t.Fatalf("ReopenOrEnqueue error: %v ok=%v", err, ok)
+	}
+	if reopenedID != id {
+		t.Fatalf("expected the same run_id %d to be reopened, got %d", id, reopenedID)
+	}
+
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != StatusRunning {
+		t.Errorf("status = %q, want %q", run.Status, StatusRunning)
+	}
+
+	stage, ok, err := s.GetStage(ctx, id, "spec")
+	if err != nil || !ok {
+		t.Fatalf("GetStage error: %v ok=%v", err, ok)
+	}
+	if stage.Status != StageStatusDone {
+		t.Errorf("stage status = %q, want %q — the completed stage must survive reopening", stage.Status, StageStatusDone)
+	}
+}
+
+func TestReopenOrEnqueue_ReopensPausedRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-paused")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if err := s.MarkRunning(ctx, id); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	if err := s.MarkPaused(ctx, id, "sess", "usage limit reached", Usage{}); err != nil {
+		t.Fatalf("MarkPaused error: %v", err)
+	}
+
+	reopenedID, ok, err := s.ReopenOrEnqueue(ctx, "task-paused")
+	if err != nil || !ok {
+		t.Fatalf("ReopenOrEnqueue error: %v ok=%v", err, ok)
+	}
+	if reopenedID != id {
+		t.Fatalf("expected the same run_id %d to be reopened, got %d", id, reopenedID)
+	}
+}
+
+func TestReopenOrEnqueue_DoesNotReopenGenuinelyFailedRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-failed")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if err := s.MarkRunning(ctx, id); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, id, "sess", "git auth failure", Usage{}); err != nil {
+		t.Fatalf("MarkFailed error: %v", err)
+	}
+
+	// Настоящая ошибка обработки — это не повод молча переиспользовать
+	// состояние сломанной попытки: новый прогон должен начаться с чистого
+	// листа (новый run_id), а не переоткрыть failed-прогон.
+	newID, ok, err := s.ReopenOrEnqueue(ctx, "task-failed")
+	if err != nil || !ok {
+		t.Fatalf("ReopenOrEnqueue error: %v ok=%v", err, ok)
+	}
+	if newID == id {
+		t.Fatal("expected a new run_id, not reuse of a genuinely failed run")
+	}
+}
+
+func TestStage_StartFinishGet(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-stage")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+
+	if _, ok, err := s.GetStage(ctx, id, "spec"); err != nil || ok {
+		t.Fatalf("expected no stage yet: ok=%v err=%v", ok, err)
+	}
+
+	if err := s.StartStage(ctx, id, "spec"); err != nil {
+		t.Fatalf("StartStage error: %v", err)
+	}
+	stage, ok, err := s.GetStage(ctx, id, "spec")
+	if err != nil || !ok {
+		t.Fatalf("GetStage error: %v ok=%v", err, ok)
+	}
+	if stage.Status != StageStatusRunning {
+		t.Errorf("status = %q, want %q", stage.Status, StageStatusRunning)
+	}
+
+	if err := s.FinishStage(ctx, id, "spec", []byte(`{"session_id":"abc"}`)); err != nil {
+		t.Fatalf("FinishStage error: %v", err)
+	}
+	stage, ok, err = s.GetStage(ctx, id, "spec")
+	if err != nil || !ok {
+		t.Fatalf("GetStage error: %v ok=%v", err, ok)
+	}
+	if stage.Status != StageStatusDone {
+		t.Errorf("status = %q, want %q", stage.Status, StageStatusDone)
+	}
+	if string(stage.Data) != `{"session_id":"abc"}` {
+		t.Errorf("data = %s, want the stored JSON", stage.Data)
+	}
+}
+
+func TestFailStage_MarksFailedNotDone(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-stage-fail")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if err := s.StartStage(ctx, id, "review"); err != nil {
+		t.Fatalf("StartStage error: %v", err)
+	}
+	if err := s.FailStage(ctx, id, "review", "usage limit reached"); err != nil {
+		t.Fatalf("FailStage error: %v", err)
+	}
+
+	stage, ok, err := s.GetStage(ctx, id, "review")
+	if err != nil || !ok {
+		t.Fatalf("GetStage error: %v ok=%v", err, ok)
+	}
+	if stage.Status != StageStatusFailed {
+		t.Errorf("status = %q, want %q", stage.Status, StageStatusFailed)
+	}
+	if stage.Error != "usage limit reached" {
+		t.Errorf("error = %q, want %q", stage.Error, "usage limit reached")
 	}
 }
 

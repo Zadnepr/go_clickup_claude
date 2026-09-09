@@ -40,7 +40,13 @@ services:
       # сами приватные ключи в контейнер не копируются.
       - SSH_AUTH_SOCK=/ssh-agent
     volumes:
-      - reviewer-data:/data
+      # ./data вместо именованного тома: на macOS Docker Desktop именованный
+      # том живёт внутри Linux-VM (/var/lib/docker/volumes/...), недоступной
+      # напрямую с хоста — а именно к SQLite-файлу нужен прямой доступ (см.
+      # README.md, раздел "Подключение к базе данных"). Bind mount кладёт его
+      # прямо в ./data/state.db рядом с проектом — открывается любым локальным
+      # sqlite3/DB Browser без остановки контейнера.
+      - ./data:/data
       # Рабочая копия репозитория: если REPO_URL не задан, смонтируйте свою
       # локальную копию с хоста вместо именованного тома, например:
       #   - /path/to/your/repo:/repo
@@ -73,5 +79,4 @@ services:
       - ~/.cache/notion-cli:/home/node/.cache/notion-cli
 
 volumes:
-  reviewer-data:
   reviewer-repo:

@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/reviewer ./cmd/reviewer
 FROM node:22-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
+    && apt-get install -y --no-install-recommends git ca-certificates openssh-client sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code @krodak/clickup-cli \

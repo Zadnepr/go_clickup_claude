@@ -91,11 +91,13 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	defer st.Close()
 
 	var recoveredTaskIDs []string
-	if ids, err := st.RecoverFromRestart(context.Background()); err != nil {
+	if runs, err := st.RecoverFromRestart(context.Background()); err != nil {
 		logger.Error("failed to recover runs after restart", "error", err.Error())
-	} else if len(ids) > 0 {
-		logger.Warn("recovered runs left running by a previous instance, resuming them", "count", len(ids), "task_ids", ids)
-		recoveredTaskIDs = ids
+	} else if len(runs) > 0 {
+		for _, r := range runs {
+			recoveredTaskIDs = append(recoveredTaskIDs, r.TaskID)
+		}
+		logger.Warn("recovered runs left running by a previous instance, resuming them", "count", len(runs), "task_ids", recoveredTaskIDs)
 	}
 
 	cuClient := clickup.NewClient(cfg.CUAPIToken, cfg.CUTeamID, clickup.WithLogger(logger))

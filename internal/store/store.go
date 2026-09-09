@@ -6,6 +6,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,6 +25,12 @@ const (
 	// блокирует повторную постановку задачи в очередь (см. TryEnqueue) —
 	// когда лимит освободится, сверка подберёт задачу заново.
 	StatusPaused = "paused"
+	// StatusInterrupted — прогон был прерван падением/убийством процесса
+	// (см. RecoverFromRestart), в отличие от StatusFailed (реальная ошибка
+	// обработки) не считается провалом: ReopenOrEnqueue находит такой
+	// прогон по task_id и продолжает его же (тот же run_id, значит и уже
+	// пройденные этапы из run_stages), а не начинает с нуля.
+	StatusInterrupted = "interrupted"
 )
 
 // Run — одна запись таблицы runs.
@@ -55,6 +63,26 @@ type Stats struct {
 	ByVerdict map[string]int
 	Tokens    Usage
 	Runs      []Run
+}
+
+// Статусы этапа прогона (таблица run_stages).
+const (
+	StageStatusRunning = "running"
+	StageStatusDone    = "done"
+	StageStatusFailed  = "failed"
+)
+
+// RunStage — одна запись таблицы run_stages: журнал того, что уже сделано
+// в рамках одного прогона (run_id), с данными, нужными, чтобы при
+// возобновлении не повторять этот этап заново (см. Queue.stage).
+type RunStage struct {
+	RunID      int64
+	Stage      string
+	Status     string
+	StartedAt  time.Time
+	FinishedAt sql.NullTime
+	Error      string
+	Data       json.RawMessage
 }
 
 // Store — обёртка над SQLite-базой с таблицей runs.
@@ -100,6 +128,24 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
+
+-- run_stages — журнал этапов одного прогона (setup/git_fetch/spec/review/
+-- decide/comment/finalize, см. Queue.stage). Каждый этап — не более одной
+-- строки на run_id (UNIQUE), data хранит то, что нужно для продолжения без
+-- повторного вызова claude при возобновлении прерванного/поставленного на
+-- паузу прогона (тот же run_id — см. ReopenOrEnqueue).
+CREATE TABLE IF NOT EXISTS run_stages (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	run_id      INTEGER NOT NULL,
+	stage       TEXT NOT NULL,
+	status      TEXT NOT NULL,
+	started_at  DATETIME NOT NULL,
+	finished_at DATETIME,
+	error       TEXT NOT NULL DEFAULT '',
+	data        TEXT NOT NULL DEFAULT '{}',
+	UNIQUE(run_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_run_stages_run_id ON run_stages(run_id);
 `
 
 // migrateTokenColumns докатывает колонки учёта токенов на базу, созданную
@@ -179,6 +225,44 @@ func (s *Store) TryEnqueue(ctx context.Context, taskID string) (runID int64, enq
 	return id, true, nil
 }
 
+// ReopenOrEnqueue — основная точка постановки задачи в очередь (см.
+// Queue.processTask/resumeTask). Если для task_id уже есть прогон в
+// возобновляемом состоянии (StatusPaused — пауза на лимите, StatusInterrupted
+// — прервано падением процесса), переоткрывает именно его: тот же run_id,
+// значит и уже пройденные этапы из run_stages не нужно проходить заново
+// (см. Queue.stage). Иначе ведёт себя как обычный TryEnqueue: создаёт новый
+// прогон, если по задаче нет активной/завершённой записи.
+//
+// StatusFailed (настоящая ошибка обработки, не лимит и не падение процесса)
+// сюда намеренно не входит — такой прогон должен начинаться с чистого листа
+// после вмешательства человека, а не молча переиспользовать состояние
+// сломанной попытки.
+//
+// Единственное открытое соединение к базе (см. Open) сериализует доступ,
+// поэтому гонки между воркерами здесь исключены без отдельных транзакций.
+func (s *Store) ReopenOrEnqueue(ctx context.Context, taskID string) (runID int64, enqueued bool, err error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id FROM runs
+		WHERE task_id = ? AND status IN (?, ?)
+		ORDER BY id DESC LIMIT 1
+	`, taskID, StatusPaused, StatusInterrupted)
+
+	var existingID int64
+	switch scanErr := row.Scan(&existingID); {
+	case scanErr == nil:
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE runs SET status = ?, error = '', finished_at = NULL WHERE id = ?
+		`, StatusRunning, existingID); err != nil {
+			return 0, false, fmt.Errorf("reopen run %d for task %s: %w", existingID, taskID, err)
+		}
+		return existingID, true, nil
+	case errors.Is(scanErr, sql.ErrNoRows):
+		return s.TryEnqueue(ctx, taskID)
+	default:
+		return 0, false, fmt.Errorf("reopen or enqueue task %s: %w", taskID, scanErr)
+	}
+}
+
 // MarkRunning переводит прогон в статус running.
 func (s *Store) MarkRunning(ctx context.Context, runID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE runs SET status = ? WHERE id = ?`, StatusRunning, runID)
@@ -234,24 +318,32 @@ func (s *Store) MarkPaused(ctx context.Context, runID int64, sessionID, errMsg s
 	return nil
 }
 
-// RecoverFromRestart переводит все прогоны в состоянии running в failed при
-// старте сервиса: контейнер мог перезапуститься посреди ревью, зависшая
-// задача не должна блокировать повторную обработку. Возвращает task_id всех
-// затронутых прогонов — вызывающая сторона доводит их до конца (см.
-// Queue.SubmitResume), а не просто ждёт, пока их снова найдёт сверка.
-func (s *Store) RecoverFromRestart(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT task_id FROM runs WHERE status = ?`, StatusRunning)
+// RecoveredRun — один прогон, найденный в состоянии running при старте
+// сервиса (см. RecoverFromRestart).
+type RecoveredRun struct {
+	RunID  int64
+	TaskID string
+}
+
+// RecoverFromRestart переводит все прогоны в состоянии running в interrupted
+// при старте сервиса: контейнер мог перезапуститься посреди ревью, зависшая
+// задача не должна блокировать повторную обработку. В отличие от StatusFailed,
+// interrupted — возобновляемый статус (см. ReopenOrEnqueue): вызывающая
+// сторона доводит прогон до конца тем же run_id (см. Queue.SubmitResume),
+// переиспользуя уже пройденные этапы из run_stages, а не начиная с нуля.
+func (s *Store) RecoverFromRestart(ctx context.Context) ([]RecoveredRun, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id FROM runs WHERE status = ?`, StatusRunning)
 	if err != nil {
 		return nil, fmt.Errorf("recover from restart: list running: %w", err)
 	}
-	var taskIDs []string
+	var recovered []RecoveredRun
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var r RecoveredRun
+		if err := rows.Scan(&r.RunID, &r.TaskID); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("recover from restart: scan task_id: %w", err)
+			return nil, fmt.Errorf("recover from restart: scan run: %w", err)
 		}
-		taskIDs = append(taskIDs, id)
+		recovered = append(recovered, r)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -260,12 +352,108 @@ func (s *Store) RecoverFromRestart(ctx context.Context) ([]string, error) {
 	rows.Close()
 
 	if _, err := s.db.ExecContext(ctx, `
-		UPDATE runs SET status = ?, error = ?, finished_at = ?
+		UPDATE runs SET status = ?, error = ?
 		WHERE status = ?
-	`, StatusFailed, "restarted: service was terminated mid-run", time.Now().UTC(), StatusRunning); err != nil {
+	`, StatusInterrupted, "restarted: service was terminated mid-run", StatusRunning); err != nil {
 		return nil, fmt.Errorf("recover from restart: %w", err)
 	}
-	return taskIDs, nil
+	return recovered, nil
+}
+
+// GetStage возвращает запись этапа прогона, если она есть. ok=false и без
+// ошибки означает, что этап ещё ни разу не запускался для этого run_id —
+// обычное дело для нового прогона, не повод логировать ошибку.
+func (s *Store) GetStage(ctx context.Context, runID int64, stage string) (rs RunStage, ok bool, err error) {
+	var data string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT run_id, stage, status, started_at, finished_at, error, data
+		FROM run_stages WHERE run_id = ? AND stage = ?
+	`, runID, stage).Scan(&rs.RunID, &rs.Stage, &rs.Status, &rs.StartedAt, &rs.FinishedAt, &rs.Error, &data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunStage{}, false, nil
+	}
+	if err != nil {
+		return RunStage{}, false, fmt.Errorf("get stage %s of run %d: %w", stage, runID, err)
+	}
+	rs.Data = json.RawMessage(data)
+	return rs, true, nil
+}
+
+// StartStage создаёт (или сбрасывает на running, если этап уже начинался,
+// но не был отмечен готовым/проваленным — например, оборвался вместе со
+// всем процессом) запись о начале этапа.
+func (s *Store) StartStage(ctx context.Context, runID int64, stage string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO run_stages (run_id, stage, status, started_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(run_id, stage) DO UPDATE SET
+			status = excluded.status, started_at = excluded.started_at,
+			finished_at = NULL, error = ''
+	`, runID, stage, StageStatusRunning, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("start stage %s of run %d: %w", stage, runID, err)
+	}
+	return nil
+}
+
+// FinishStage отмечает этап готовым и сохраняет его результат (data — JSON,
+// например id сессии claude, путь к файлу спеки, вердикт) — это и есть
+// «результат /spec, сохранённый в табличку», который переиспользуется при
+// возобновлении прогона вместо повторного вызова claude (см. Queue.stage).
+func (s *Store) FinishStage(ctx context.Context, runID int64, stage string, data []byte) error {
+	if len(data) == 0 {
+		data = []byte("{}")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE run_stages SET status = ?, finished_at = ?, data = ?
+		WHERE run_id = ? AND stage = ?
+	`, StageStatusDone, time.Now().UTC(), string(data), runID, stage)
+	if err != nil {
+		return fmt.Errorf("finish stage %s of run %d: %w", stage, runID, err)
+	}
+	return nil
+}
+
+// FailStage отмечает этап проваленным. Проваленный этап никогда не
+// считается «уже готовым» — следующая попытка (StartStage) запускает его
+// заново.
+func (s *Store) FailStage(ctx context.Context, runID int64, stage, errMsg string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE run_stages SET status = ?, finished_at = ?, error = ?
+		WHERE run_id = ? AND stage = ?
+	`, StageStatusFailed, time.Now().UTC(), errMsg, runID, stage)
+	if err != nil {
+		return fmt.Errorf("fail stage %s of run %d: %w", stage, runID, err)
+	}
+	return nil
+}
+
+// ListStages возвращает все этапы прогона в порядке выполнения — для
+// диагностики (например, будущего расширения /api/status).
+func (s *Store) ListStages(ctx context.Context, runID int64) ([]RunStage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT run_id, stage, status, started_at, finished_at, error, data
+		FROM run_stages WHERE run_id = ? ORDER BY id ASC
+	`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list stages of run %d: %w", runID, err)
+	}
+	defer rows.Close()
+
+	var stages []RunStage
+	for rows.Next() {
+		var rs RunStage
+		var data string
+		if err := rows.Scan(&rs.RunID, &rs.Stage, &rs.Status, &rs.StartedAt, &rs.FinishedAt, &rs.Error, &data); err != nil {
+			return nil, fmt.Errorf("scan stage row: %w", err)
+		}
+		rs.Data = json.RawMessage(data)
+		stages = append(stages, rs)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stage rows: %w", err)
+	}
+	return stages, nil
 }
 
 // Ping проверяет, что база данных открыта и отвечает (используется в /readyz).
