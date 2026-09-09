@@ -68,6 +68,7 @@ services:
       # содержит сохранённую сессию/токен — тот же принцип, что и SSH-агент:
       # используются реальные креды хоста, ничего не копируется в образ.
       - ../cli/notion-private-api-mcp:/opt/notion-cli:ro
+      - ../.claude/specs:/home/node/.claude/specs:ro
       - ~/.config/notion-cli:/home/node/.config/notion-cli:ro
       - ~/.cache/notion-cli:/home/node/.cache/notion-cli
 
