@@ -284,7 +284,16 @@ func (m *manualRunner) RunNow(ctx context.Context, taskID, model, effort string)
 		// model/effort — переопределение только на этот прогон (см.
 		// Требование «выбрать модель для текущей задачи»); для массового
 		// пересканирования ниже это не имеет смысла и игнорируется.
-		m.queue.SubmitWithOptions(taskID, queue.RunOptions{Model: model, Effort: effort})
+		//
+		// SkipEligibility: true — явный ручной запуск конкретного task_id
+		// не обязан ждать тега TRIGGER_TAG на карточке (в отличие от
+		// вебхука и сверки, см. scanAndSubmit) — иначе, например, кнопка
+		// «Запустить проверку» для задач без тега в дашборде («Остальные
+		// задачи в колонке-триггере без тега») молча ничего не делала бы:
+		// processTask отбрасывал бы прогон на проверке тега, а HTTP-ответ
+		// всё равно уходил бы 202 (Submit ставит в буфер, не дожидаясь
+		// результата обработки).
+		m.queue.SubmitWithOptions(taskID, queue.RunOptions{Model: model, Effort: effort, SkipEligibility: true})
 		return []string{taskID}, nil
 	}
 	ids, err := scanAndSubmit(ctx, m.cfg, m.cuClient, m.queue)

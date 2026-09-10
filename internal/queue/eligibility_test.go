@@ -50,6 +50,20 @@ func TestIsEligible_WrongStatus(t *testing.T) {
 	}
 }
 
+func TestBelongsToConfiguredList_SameList(t *testing.T) {
+	task := &clickup.Task{ListID: "list1"}
+	if !belongsToConfiguredList(task, baseCfg()) {
+		t.Fatal("expected task in the configured list to belong to it, regardless of tag/status")
+	}
+}
+
+func TestBelongsToConfiguredList_DifferentList(t *testing.T) {
+	task := &clickup.Task{ListID: "other-list"}
+	if belongsToConfiguredList(task, baseCfg()) {
+		t.Fatal("expected task in a different list to not belong to it")
+	}
+}
+
 func TestSpecFileID_PrefersCustomID(t *testing.T) {
 	task := &clickup.Task{ID: "869d9kt6a", CustomID: "PNL-4528"}
 	if got := specFileID(task); got != "PNL-4528" {

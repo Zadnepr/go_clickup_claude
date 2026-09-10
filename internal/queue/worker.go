@@ -88,6 +88,16 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 	return config.NormalizeStatus(task.Status) == config.NormalizeStatus(cfg.StatusTrigger)
 }
 
+// belongsToConfiguredList проверяет только принадлежность задачи
+// настроенному списку (CU_LIST_ID) — без тега и статуса. Используется
+// вместо полного isEligible при явном ручном запуске конкретного task_id
+// (см. RunOptions.SkipEligibility): само подтверждение "запустить именно
+// эту задачу" уже пришло от оператора, но задача из совершенно другого
+// списка — почти наверняка результат опечатки в ID, а не намеренный выбор.
+func belongsToConfiguredList(task *clickup.Task, cfg *config.Config) bool {
+	return task.ListID == cfg.CUListID
+}
+
 // specFileID возвращает ID задачи, под которым сохраняется файл ТЗ
 // (`specs/<ID>.md`, см. Runner.SpecFilePath): человекочитаемый custom_id
 // (например, "PNL-4528"), если он у задачи задан, иначе нативный ID ClickUp.
@@ -139,7 +149,12 @@ func (q *Queue) processTask(taskID string, opts RunOptions) {
 		return
 	}
 
-	if !isEligible(task, cfg) {
+	if opts.SkipEligibility {
+		if !belongsToConfiguredList(task, cfg) {
+			log.Warn("manual run refused: task does not belong to the configured list", "list_id", task.ListID)
+			return
+		}
+	} else if !isEligible(task, cfg) {
 		log.Debug("task does not meet trigger condition, skipping without a dedup record")
 		return
 	}

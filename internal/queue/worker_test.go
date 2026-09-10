@@ -463,6 +463,57 @@ func TestProcessTask_NotEligible_SkipsWithoutDedupRecord(t *testing.T) {
 	}
 }
 
+func TestProcessTask_SkipEligibility_ProcessesTaskWithoutTriggerTag(t *testing.T) {
+	// Задачи из "Остальные задачи в колонке-триггере без тега" (дашборд) —
+	// по определению без TRIGGER_TAG; раньше ручной запуск для них молча
+	// ничего не делал (processTask отбрасывал их на проверке isEligible),
+	// хотя HTTP-ответ уже успевал вернуть 202 (см. отзыв: "ручной запуск...
+	// не работает"). SkipEligibility — явное исключение именно для этого.
+	task := &clickup.Task{
+		ID: "40", Name: "Task 40", URL: "https://app.clickup.com/t/40",
+		ListID: "list1", Tags: []string{"unrelated"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specContent: "spec content",
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("40", RunOptions{SkipEligibility: true})
+
+	if !runner.reviewCalled {
+		t.Fatal("expected the run to proceed despite the missing trigger tag")
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 slack notifications (started + finished), got %d", len(*calls))
+	}
+}
+
+func TestProcessTask_SkipEligibility_StillRefusesWrongList(t *testing.T) {
+	task := &clickup.Task{
+		ID: "41", Name: "Task 41", URL: "https://app.clickup.com/t/41",
+		ListID: "some-other-list", Tags: []string{"unrelated"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("41", RunOptions{SkipEligibility: true})
+
+	if runner.specCalled || runner.reviewCalled {
+		t.Fatal("expected a task from a different list to be refused even with SkipEligibility")
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("expected no slack notifications, got %d", len(*calls))
+	}
+}
+
 func TestProcessTask_SkipsWhileAlreadyRunning(t *testing.T) {
 	// Настоящая защита от дубликата события (два вебхука на одно и то же
 	// изменение почти одновременно) — active-статус (queued/running) уже
