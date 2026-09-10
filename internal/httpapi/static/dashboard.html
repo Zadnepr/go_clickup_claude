@@ -659,9 +659,11 @@ async function loadQueue() {
         qBody.innerHTML = '<div class="empty">Очередь пуста</div>';
         return;
       }
-      qBody.innerHTML = '<div class="queue-list">' + pending.map(id => `
-        <div class="queue-item" data-task="${esc(id)}">
-          <a class="id" href="${esc(clickupURL(id))}" target="_blank" rel="noopener">${esc(id)}</a>
+      qBody.innerHTML = '<div class="queue-list">' + pending.map(t => `
+        <div class="queue-item" data-task="${esc(t.task_id)}">
+          <a class="id" href="${esc(t.url || clickupURL(t.task_id))}" target="_blank" rel="noopener">${esc(t.custom_id || t.task_id)}</a>
+          ${avatarsHTML(t.assignees)}
+          <span class="name">${esc(t.name || "")}</span>
           ${runControlsHTML()}
           <button class="btn primary" data-act="run">▶️ Запустить сейчас</button>
         </div>`).join("") + "</div>";

@@ -17,6 +17,7 @@ import (
 
 type fakeClickUpReader struct {
 	task       *clickup.Task
+	tasksByID  map[string]*clickup.Task
 	taskErr    error
 	members    []clickup.Member
 	memErr     error
@@ -26,6 +27,11 @@ type fakeClickUpReader struct {
 }
 
 func (f *fakeClickUpReader) GetTask(ctx context.Context, taskID string) (*clickup.Task, error) {
+	if f.tasksByID != nil {
+		if t, ok := f.tasksByID[taskID]; ok {
+			return t, nil
+		}
+	}
 	return f.task, f.taskErr
 }
 
@@ -108,7 +114,12 @@ func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
 		run:    &store.Run{ID: 5, TaskID: "t1", Status: "running", InputTokens: 10, OutputTokens: 20, CostUSD: 0.01},
 		stages: []store.RunStage{{RunID: 5, Stage: "spec", Status: "done"}},
 	}
-	cu := &fakeClickUpReader{task: &clickup.Task{ID: "t1", Name: "Task One", URL: "https://x/t1"}}
+	cu := &fakeClickUpReader{
+		task: &clickup.Task{ID: "t1", Name: "Task One", URL: "https://x/t1"},
+		tasksByID: map[string]*clickup.Task{
+			"t2": {ID: "t2", CustomID: "PNL-2", Name: "Task Two", URL: "https://x/t2"},
+		},
+	}
 	deps := Deps{Queue: sub, Store: st, ClickUp: cu, Logger: discardLogger()}
 	mux := NewMux(deps)
 
@@ -127,7 +138,12 @@ func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
 			Status   string           `json:"status"`
 			Stages   []store.RunStage `json:"stages"`
 		} `json:"active"`
-		Pending []string `json:"pending"`
+		Pending []struct {
+			TaskID   string `json:"task_id"`
+			CustomID string `json:"custom_id"`
+			Name     string `json:"name"`
+			URL      string `json:"url"`
+		} `json:"pending"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -138,8 +154,16 @@ func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
 	if body.Active[0].Status != "running" || len(body.Active[0].Stages) != 1 {
 		t.Errorf("unexpected active run details: %+v", body.Active[0])
 	}
-	if len(body.Pending) != 2 || body.Pending[0] != "t2" {
+	if len(body.Pending) != 2 || body.Pending[0].TaskID != "t2" {
 		t.Errorf("unexpected pending: %+v", body.Pending)
+	}
+	if body.Pending[0].CustomID != "PNL-2" || body.Pending[0].Name != "Task Two" {
+		t.Errorf("expected pending[0] resolved to custom_id/name, got %+v", body.Pending[0])
+	}
+	// t3 не найдена в fakeClickUpReader.tasksByID — фолбэк на f.task (общий
+	// GetTask-результат этого фейка), а не падение/пустая запись.
+	if body.Pending[1].TaskID != "t3" {
+		t.Errorf("expected pending[1].task_id = t3, got %+v", body.Pending[1])
 	}
 }
 

@@ -77,13 +77,43 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 			active = append(active, view)
 		}
 
+		var members map[int]clickup.Member
+		loadMembersOnce := func() map[int]clickup.Member {
+			if members == nil {
+				members = loadMembersByID(ctx, deps)
+			}
+			return members
+		}
+
+		// pending — задачи из буфера очереди (см. Queue.Pending), пока это
+		// только "голые" task_id. Разрешаем их в тот же вид, что и остальные
+		// списки (custom_id, название, аватарки исполнителей) — иначе
+		// дашборд может показать только ID задачи вместо PNL-<...> и имени
+		// (см. Требование «в статистике/списках — custom_id и имя, а не
+		// сырой ID ClickUp»).
+		pending := []otherTaskView{}
+		if deps.ClickUp != nil {
+			for _, taskID := range deps.Queue.Pending() {
+				view := otherTaskView{TaskID: taskID, URL: "https://app.clickup.com/t/" + taskID}
+				if task, err := deps.ClickUp.GetTask(ctx, taskID); err == nil {
+					view.CustomID = task.CustomID
+					view.Name = task.Name
+					view.URL = task.URL
+					view.Assignees = resolveAssigneeRefs(task.Assignees, loadMembersOnce())
+				} else {
+					deps.Logger.Warn("failed to load pending task details", "task_id", taskID, "error", err.Error())
+				}
+				pending = append(pending, view)
+			}
+		}
+
 		otherToCheck := []otherTaskView{}
 		if deps.ClickUp != nil && deps.Cfg != nil && deps.Cfg.StatusTrigger != "" {
 			tasks, err := deps.ClickUp.ListTasksByStatus(ctx, deps.Cfg.CUListID, deps.Cfg.StatusTrigger)
 			if err != nil {
 				deps.Logger.Warn("failed to list other tasks in the trigger status", "error", err.Error())
 			} else {
-				members := loadMembersByID(ctx, deps)
+				members := loadMembersOnce()
 				wantTag := config.NormalizeStatus(deps.Cfg.TriggerTag)
 				for _, task := range tasks {
 					if taskHasTag(task.Tags, wantTag) {
@@ -100,7 +130,7 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"active":         active,
-			"pending":        deps.Queue.Pending(),
+			"pending":        pending,
 			"other_to_check": otherToCheck,
 		})
 	}
