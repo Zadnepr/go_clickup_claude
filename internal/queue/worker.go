@@ -153,6 +153,9 @@ func (q *Queue) processTask(taskID string, opts RunOptions) {
 		log.Debug("task already has an active or completed run, skipping")
 		return
 	}
+	if err := q.deps.Store.SetRunCustomID(ctx, runID, task.CustomID); err != nil {
+		log.Error("failed to record custom_id for run", "error", err.Error())
+	}
 
 	q.registerActive(taskID, runID, cancel)
 	defer q.unregisterActive(taskID)
@@ -194,6 +197,9 @@ func (q *Queue) resumeTask(taskID string) {
 	if !enqueued {
 		log.Debug("resumed task already has an active or completed run, skipping")
 		return
+	}
+	if err := q.deps.Store.SetRunCustomID(ctx, runID, task.CustomID); err != nil {
+		log.Error("failed to record custom_id for run", "error", err.Error())
 	}
 
 	log.Info("resuming review interrupted by a previous instance")

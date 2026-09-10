@@ -680,6 +680,14 @@ func TestProcessTask_UsesCustomIDForSpecFileWhenPresent(t *testing.T) {
 	if runner.gotSpecPath != want {
 		t.Errorf("specPath passed to RunReview = %q, want %q", runner.gotSpecPath, want)
 	}
+
+	run, err := deps.Store.GetRun(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.CustomID != "PNL-4528" {
+		t.Errorf("expected the run to record CustomID PNL-4528, got: %+v", run)
+	}
 }
 
 func TestResumeTask_BypassesEligibility(t *testing.T) {

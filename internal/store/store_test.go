@@ -246,6 +246,48 @@ func TestMarkDone_StoresTokenUsage(t *testing.T) {
 	}
 }
 
+func TestSetRunCustomID_ReflectedInGetRunAndStats(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.TryEnqueue(ctx, "task-custom-id")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if run, err := s.GetRun(ctx, id); err != nil || run.CustomID != "" {
+		t.Fatalf("expected empty CustomID before SetRunCustomID, got %q (err=%v)", run.CustomID, err)
+	}
+
+	if err := s.SetRunCustomID(ctx, id, "PNL-4528"); err != nil {
+		t.Fatalf("SetRunCustomID error: %v", err)
+	}
+
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.CustomID != "PNL-4528" {
+		t.Errorf("CustomID = %q, want PNL-4528", run.CustomID)
+	}
+
+	stats, err := s.Stats(ctx, time.Time{})
+	if err != nil {
+		t.Fatalf("Stats error: %v", err)
+	}
+	found := false
+	for _, r := range stats.Runs {
+		if r.ID == id {
+			found = true
+			if r.CustomID != "PNL-4528" {
+				t.Errorf("Stats run CustomID = %q, want PNL-4528", r.CustomID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected the run to appear in Stats")
+	}
+}
+
 func TestListActive_ReturnsOnlyQueuedAndRunning(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

@@ -371,6 +371,49 @@ func TestQueueHandler_OtherToCheck_ExcludesTaggedTasks(t *testing.T) {
 	}
 }
 
+func TestQueueHandler_OtherToCheck_ResolvesAssigneeAvatars(t *testing.T) {
+	cfg := &config.Config{CUListID: "list1", StatusTrigger: "to check", TriggerTag: "ai"}
+	cu := &fakeClickUpReader{
+		otherTasks: []clickup.Task{
+			{ID: "1", Name: "Untagged", Assignees: []int{81838052, 999}},
+		},
+		members: []clickup.Member{{ID: 81838052, Username: "Sergey", Avatar: "https://x/y.jpg"}},
+	}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: &fakePinger{}, ClickUp: cu, Cfg: cfg, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		OtherToCheck []struct {
+			Assignees []struct {
+				ID       int    `json:"id"`
+				Username string `json:"username"`
+				Avatar   string `json:"avatar"`
+			} `json:"assignees"`
+		} `json:"other_to_check"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.OtherToCheck) != 1 || len(body.OtherToCheck[0].Assignees) != 2 {
+		t.Fatalf("unexpected response: %+v", body.OtherToCheck)
+	}
+	resolved := body.OtherToCheck[0].Assignees[0]
+	if resolved.ID != 81838052 || resolved.Username != "Sergey" || resolved.Avatar != "https://x/y.jpg" {
+		t.Errorf("expected first assignee resolved to Sergey, got: %+v", resolved)
+	}
+	unresolved := body.OtherToCheck[0].Assignees[1]
+	if unresolved.ID != 999 || unresolved.Username != "" {
+		t.Errorf("expected second assignee to be unresolved (no member found), got: %+v", unresolved)
+	}
+}
+
 func TestRunHandler_PassesModelEffortToManualRunner(t *testing.T) {
 	trigger := &fakeManualRunner{submitted: []string{"123"}}
 	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
