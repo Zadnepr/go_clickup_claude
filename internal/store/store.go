@@ -85,6 +85,30 @@ type RunStage struct {
 	Data       json.RawMessage
 }
 
+// ClaudeInvocation — один вызов `claude -p` целиком: полный запрос и полный
+// ответ claude, отдельно от run_stages (та таблица хранит только то, что
+// нужно для возобновления прогона). Нужна для аудита реального расхода
+// токенов по каждому вызову и для хранения полного текста ответа сессии
+// (см. README, раздел «Таблицы claude_invocations и run_stages»).
+type ClaudeInvocation struct {
+	ID           int64
+	RunID        int64
+	Stage        string
+	SessionID    string
+	Model        string
+	Effort       string
+	Prompt       string
+	Output       string
+	Stderr       string
+	Subtype      string
+	IsError      bool
+	InputTokens  int64
+	OutputTokens int64
+	CostUSD      float64
+	StartedAt    time.Time
+	FinishedAt   time.Time
+}
+
 // Store — обёртка над SQLite-базой с таблицей runs.
 type Store struct {
 	db *sql.DB
@@ -146,6 +170,33 @@ CREATE TABLE IF NOT EXISTS run_stages (
 	UNIQUE(run_id, stage)
 );
 CREATE INDEX IF NOT EXISTS idx_run_stages_run_id ON run_stages(run_id);
+
+-- claude_invocations — полный журнал вызовов "claude -p": один вызов —
+-- одна строка, с полным запросом, полным ответом и токенами именно этого
+-- вызова. id растёт монотонно, поэтому порядок строк по run_id — это и есть
+-- хронология сессий этого прогона (см. Требование 4: "таблица с сессиями
+-- claude ... сохранять хронологию"). Отдельно от run_stages: там — только
+-- то, что нужно для возобновления, здесь — полный лог для аудита расхода
+-- токенов и разбора ответов claude, без влияния на логику возобновления.
+CREATE TABLE IF NOT EXISTS claude_invocations (
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	run_id        INTEGER NOT NULL,
+	stage         TEXT NOT NULL,
+	session_id    TEXT NOT NULL DEFAULT '',
+	model         TEXT NOT NULL DEFAULT '',
+	effort        TEXT NOT NULL DEFAULT '',
+	prompt        TEXT NOT NULL DEFAULT '',
+	output        TEXT NOT NULL DEFAULT '',
+	stderr        TEXT NOT NULL DEFAULT '',
+	subtype       TEXT NOT NULL DEFAULT '',
+	is_error      INTEGER NOT NULL DEFAULT 0,
+	input_tokens  INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
+	cost_usd      REAL NOT NULL DEFAULT 0,
+	started_at    DATETIME NOT NULL,
+	finished_at   DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claude_invocations_run_id ON claude_invocations(run_id);
 `
 
 // migrateTokenColumns докатывает колонки учёта токенов на базу, созданную
@@ -454,6 +505,70 @@ func (s *Store) ListStages(ctx context.Context, runID int64) ([]RunStage, error)
 		return nil, fmt.Errorf("iterate stage rows: %w", err)
 	}
 	return stages, nil
+}
+
+// RecordInvocation сохраняет один завершённый вызов `claude -p` целиком:
+// запрос, полный ответ, метаданные и токены именно этого вызова (Требование:
+// «лог процесса работы claude ... с количеством потраченных токенов на этот
+// этап. И чтобы ответ всей сессии тоже писался в таблицу»). Вызывается уже
+// после завершения claude — для расхода токенов по ходу выполнения
+// см. UpdateRunningUsage.
+func (s *Store) RecordInvocation(ctx context.Context, inv ClaudeInvocation) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO claude_invocations
+			(run_id, stage, session_id, model, effort, prompt, output, stderr, subtype, is_error,
+			 input_tokens, output_tokens, cost_usd, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, inv.RunID, inv.Stage, inv.SessionID, inv.Model, inv.Effort, inv.Prompt, inv.Output, inv.Stderr,
+		inv.Subtype, inv.IsError, inv.InputTokens, inv.OutputTokens, inv.CostUSD, inv.StartedAt.UTC(), inv.FinishedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("record claude invocation for run %d stage %s: %w", inv.RunID, inv.Stage, err)
+	}
+	return res.LastInsertId()
+}
+
+// ListInvocations возвращает все вызовы claude одного прогона в порядке
+// выполнения — для диагностики и будущего расширения API статуса.
+func (s *Store) ListInvocations(ctx context.Context, runID int64) ([]ClaudeInvocation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, stage, session_id, model, effort, prompt, output, stderr, subtype, is_error,
+		       input_tokens, output_tokens, cost_usd, started_at, finished_at
+		FROM claude_invocations WHERE run_id = ? ORDER BY id ASC
+	`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list claude invocations of run %d: %w", runID, err)
+	}
+	defer rows.Close()
+
+	var invocations []ClaudeInvocation
+	for rows.Next() {
+		var inv ClaudeInvocation
+		if err := rows.Scan(&inv.ID, &inv.RunID, &inv.Stage, &inv.SessionID, &inv.Model, &inv.Effort,
+			&inv.Prompt, &inv.Output, &inv.Stderr, &inv.Subtype, &inv.IsError,
+			&inv.InputTokens, &inv.OutputTokens, &inv.CostUSD, &inv.StartedAt, &inv.FinishedAt); err != nil {
+			return nil, fmt.Errorf("scan claude invocation row: %w", err)
+		}
+		invocations = append(invocations, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claude invocation rows: %w", err)
+	}
+	return invocations, nil
+}
+
+// UpdateRunningUsage обновляет расход токенов/стоимости прогона, ещё не
+// завершённого, — вызывается по ходу стриминга ответа claude (см.
+// review.Runner.run и его параметр onUsage), чтобы расход был виден в БД
+// в реальном времени, а не только после окончания этапа (Требование:
+// контроль подозреваемого перерасхода токенов). Не трогает статус прогона.
+func (s *Store) UpdateRunningUsage(ctx context.Context, runID int64, usage Usage) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?
+	`, usage.InputTokens, usage.OutputTokens, usage.CostUSD, runID)
+	if err != nil {
+		return fmt.Errorf("update running usage for run %d: %w", runID, err)
+	}
+	return nil
 }
 
 // Ping проверяет, что база данных открыта и отвечает (используется в /readyz).

@@ -27,26 +27,44 @@ func TestDecide_Pass_NoAssigneeConfigured(t *testing.T) {
 	}
 }
 
-func TestDecide_Fail_UsesConfiguredAssignee(t *testing.T) {
-	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnFail: "20"}
-	status, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, []int{7})
+func TestDecide_Pass_IgnoresDeveloperCustomField(t *testing.T) {
+	// developerIDs (custom field "Developer") — приоритет только при
+	// провале (см. Decide); на pass поведение не меняется.
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnPass: "10"}
+	_, assignees := Decide(review.Verdict{Status: review.StatusPass}, cfg, 999, []int{555})
+	if len(assignees) != 1 || assignees[0] != 10 {
+		t.Errorf("expected ASSIGNEE_ON_PASS to still apply on pass, got: %+v", assignees)
+	}
+}
+
+func TestDecide_Fail_PrefersDeveloperCustomFieldOverEverything(t *testing.T) {
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnFail: "20", AssigneeOnPass: "10"}
+	status, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, []int{81838052})
 	if status != "to fix" {
 		t.Errorf("status = %q, want %q", status, "to fix")
 	}
+	if len(assignees) != 1 || assignees[0] != 81838052 {
+		t.Errorf("custom field Developer should take priority over everything, got: %+v", assignees)
+	}
+}
+
+func TestDecide_Fail_FallsBackToAssigneeOnFailWhenNoDeveloperField(t *testing.T) {
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnFail: "20"}
+	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, nil)
 	if len(assignees) != 1 || assignees[0] != 20 {
-		t.Errorf("configured ASSIGNEE_ON_FAIL should take priority, got: %+v", assignees)
+		t.Errorf("expected fallback to ASSIGNEE_ON_FAIL, got: %+v", assignees)
 	}
 }
 
-func TestDecide_Fail_FallsBackToOriginalAssignees(t *testing.T) {
-	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
-	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 42, []int{7, 8})
-	if len(assignees) != 2 || assignees[0] != 7 || assignees[1] != 8 {
-		t.Errorf("expected fallback to original assignees [7 8], got: %+v", assignees)
+func TestDecide_Fail_FallsBackToAssigneeOnPassWhenNoDeveloperFieldOrFailConfig(t *testing.T) {
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnPass: "10"}
+	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, nil)
+	if len(assignees) != 1 || assignees[0] != 10 {
+		t.Errorf("expected fallback to ASSIGNEE_ON_PASS, got: %+v", assignees)
 	}
 }
 
-func TestDecide_Fail_FallsBackToCreatorWhenNoOriginalAssignees(t *testing.T) {
+func TestDecide_Fail_FallsBackToCreatorWhenNothingConfigured(t *testing.T) {
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix"}
 	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 42, nil)
 	if len(assignees) != 1 || assignees[0] != 42 {

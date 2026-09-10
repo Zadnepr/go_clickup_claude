@@ -56,6 +56,25 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.CUWebhookSecret != "" {
 		t.Errorf("CUWebhookSecret = %q, want empty (optional)", cfg.CUWebhookSecret)
 	}
+	if cfg.ClaudeModel != "sonnet" {
+		t.Errorf("ClaudeModel = %q, want sonnet", cfg.ClaudeModel)
+	}
+	if cfg.ClaudeEffort != "high" {
+		t.Errorf("ClaudeEffort = %q, want high", cfg.ClaudeEffort)
+	}
+}
+
+func TestLoad_ClaudeModelAndEffortOverride(t *testing.T) {
+	cfg, err := Load(envMap(map[string]string{"CLAUDE_MODEL": "haiku", "CLAUDE_EFFORT": "low"}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ClaudeModel != "haiku" {
+		t.Errorf("ClaudeModel = %q, want haiku", cfg.ClaudeModel)
+	}
+	if cfg.ClaudeEffort != "low" {
+		t.Errorf("ClaudeEffort = %q, want low", cfg.ClaudeEffort)
+	}
 }
 
 func TestLoad_MissingRequired(t *testing.T) {

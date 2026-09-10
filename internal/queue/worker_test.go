@@ -76,41 +76,47 @@ func (f *fakeClickUp) AddComment(ctx context.Context, taskID, text string) error
 
 // fakeRunner — фейковая реализация интерфейса Runner.
 type fakeRunner struct {
-	specErr         error
-	specExists      bool   // существует для любого запрошенного ID
-	specExistsForID string // существует только для конкретного ID (приоритет над specExists)
-	specUsage       review.TokenUsage
-	result          review.Result
-	reviewErr       error
-	gitErr          error
-	gotSpecPath     string // specPath, с которым реально вызвали RunReview
-	reviewCalled    bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
-	specCalled      bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
+	specErr      error
+	specContent  string // то, что вернёт RunSpec как собранное ТЗ ("" — /spec не собрала ТЗ)
+	specUsage    review.TokenUsage
+	result       review.Result
+	reviewErr    error
+	gitErr       error
+	gotSpecPath  string // specPath, с которым реально вызвали RunReview
+	reviewCalled bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
+	specCalled   bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
+
+	specDirOnce sync.Once
+	specDir     string
 }
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
 
-func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string) (string, review.TokenUsage, error) {
+func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string, onUsage func(review.TokenUsage)) (review.SpecResult, error) {
 	f.specCalled = true
-	return "spec-session", f.specUsage, f.specErr
+	return review.SpecResult{SessionID: "spec-session", Content: f.specContent, Usage: f.specUsage}, f.specErr
 }
 
-func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error) {
+func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string, onUsage func(review.TokenUsage)) (review.Result, error) {
 	f.reviewCalled = true
 	f.gotSpecPath = specPath
 	return f.result, f.reviewErr
 }
 
+// SpecFilePath отдаёт путь во временном каталоге, приватном для этого
+// fakeRunner, — воркер пишет туда файл ТЗ по-настоящему (Queue.ensureSpecFile
+// делает реальный os.WriteFile), поэтому путь должен существовать и быть
+// доступным для записи, а не просто различаться "существует/не существует",
+// как было при прежней (файловой) схеме.
 func (f *fakeRunner) SpecFilePath(taskID string) string {
-	exists := f.specExists
-	if f.specExistsForID != "" {
-		exists = taskID == f.specExistsForID
-	}
-	if exists {
-		// Существующий файл: сам тестовый бинарь на диске годится как заглушка.
-		return filepath.Join(".", "worker_test.go")
-	}
-	return filepath.Join(string(filepath.Separator), "nonexistent", "spec-"+taskID+".md")
+	f.specDirOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "fake-spec")
+		if err != nil {
+			panic(err)
+		}
+		f.specDir = dir
+	})
+	return filepath.Join(f.specDir, taskID+".md")
 }
 
 func newTestDeps(t *testing.T, cu *fakeClickUp, runner *fakeRunner, cfg *config.Config) (Deps, *httptest.Server, *[]slackCall) {
@@ -195,7 +201,7 @@ func TestProcessTask_PassVerdict_FullPipeline(t *testing.T) {
 	task := &clickup.Task{ID: "1", Name: "Task 1", URL: "https://app.clickup.com/t/1", ListID: "list1", Tags: []string{"ai"}, Status: "to check", CreatorID: 5}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:    "Всё отлично.\nИТОГ: критичных=0 важных=0 минор=1 статус=pass",
 			SessionID: "sess-1",
@@ -453,7 +459,7 @@ func TestProcessTask_RemovesAssigneesBeforeCheck(t *testing.T) {
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -471,7 +477,7 @@ func TestProcessTask_RemovesAssigneesBeforeCheck(t *testing.T) {
 	}
 }
 
-func TestProcessTask_Fail_ReassignsOriginalAssigneesWhenNoOverrideConfigured(t *testing.T) {
+func TestProcessTask_Fail_FallsBackToCreatorWhenNothingConfigured(t *testing.T) {
 	task := &clickup.Task{
 		ID: "7", Name: "Task 7", URL: "https://app.clickup.com/t/7",
 		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
@@ -479,7 +485,7 @@ func TestProcessTask_Fail_ReassignsOriginalAssigneesWhenNoOverrideConfigured(t *
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "плохо\nИТОГ: критичных=1 важных=0 минор=0 статус=fail",
 			Verdict: review.Verdict{Status: review.StatusFail, Critical: 1},
@@ -487,15 +493,47 @@ func TestProcessTask_Fail_ReassignsOriginalAssigneesWhenNoOverrideConfigured(t *
 	}
 
 	cfg := testConfig(t)
-	cfg.AssigneeOnFail = "" // без явного override — должны вернуться исходные исполнители
+	// Ни custom field Developer, ни ASSIGNEE_ON_FAIL/ASSIGNEE_ON_PASS не
+	// заданы — снятые на время проверки исходные исполнители больше не
+	// восстанавливаются автоматически (см. Decide): последним резервом
+	// остаётся создатель задачи.
+	cfg.AssigneeOnFail = ""
 	deps, _, _ := newTestDeps(t, cu, runner, cfg)
 	q := New(deps, 10)
 	q.processTask("7")
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
-	if len(cu.assignees) != 1 || len(cu.assignees[0]) != 2 || cu.assignees[0][0] != 7 || cu.assignees[0][1] != 8 {
-		t.Errorf("expected original assignees [7 8] to be reassigned on failure, got: %+v", cu.assignees)
+	if len(cu.assignees) != 1 || len(cu.assignees[0]) != 1 || cu.assignees[0][0] != 99 {
+		t.Errorf("expected fallback to the task creator (99), got: %+v", cu.assignees)
+	}
+}
+
+func TestProcessTask_Fail_PrefersDeveloperCustomFieldOverAssigneeOnFail(t *testing.T) {
+	task := &clickup.Task{
+		ID: "22", Name: "Task 22", URL: "https://app.clickup.com/t/22",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+		Assignees: []int{7, 8}, CreatorID: 99, DeveloperIDs: []int{81838052},
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specContent: "spec content",
+		result: review.Result{
+			Output:  "плохо\nИТОГ: критичных=1 важных=0 минор=0 статус=fail",
+			Verdict: review.Verdict{Status: review.StatusFail, Critical: 1},
+		},
+	}
+
+	// AssigneeOnFail сконфигурирован (testConfig задаёт "20"), но custom
+	// field Developer на задаче важнее — именно он должен победить.
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("22")
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.assignees) != 1 || len(cu.assignees[0]) != 1 || cu.assignees[0][0] != 81838052 {
+		t.Errorf("expected custom field Developer (81838052) to take priority over ASSIGNEE_ON_FAIL, got: %+v", cu.assignees)
 	}
 }
 
@@ -503,7 +541,7 @@ func TestProcessTask_RemovesTriggerTagAfterFinishing(t *testing.T) {
 	task := &clickup.Task{ID: "8", Name: "Task 8", URL: "https://app.clickup.com/t/8", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -561,7 +599,7 @@ func TestProcessTask_UsesCustomIDForSpecFileWhenPresent(t *testing.T) {
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExistsForID: "PNL-4528", // /spec сохранила файл по человекочитаемому ID, а не нативному
+		specContent: "spec content", // проверяем, что имя файла берётся из CustomID задачи
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -588,7 +626,7 @@ func TestResumeTask_BypassesEligibility(t *testing.T) {
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -633,7 +671,7 @@ func TestResumeTask_ReusesCompletedSpecStage_DoesNotCallRunSpecAgain(t *testing.
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExistsForID: "should-not-be-checked-again",
+		specContent: "spec content", // не важно: RunSpec не должна вызываться повторно
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -649,7 +687,8 @@ func TestResumeTask_ReusesCompletedSpecStage_DoesNotCallRunSpecAgain(t *testing.
 	mustFinishStage(t, deps, runID, "setup", setupData{})
 	mustFinishStage(t, deps, runID, "spec", specStageData{
 		SessionID: "cached-spec-session",
-		SpecPath:  "specs/cached.md",
+		SpecID:    "cached",
+		Content:   "cached spec content",
 		Usage:     review.TokenUsage{InputTokens: 10, OutputTokens: 5, CostUSD: 0.01},
 	})
 	// Прогон "прервался" сразу после /spec — сервис перезапустился.
@@ -765,7 +804,7 @@ func TestQueue_SubmitResume_BypassesEligibilityThroughRealDispatch(t *testing.T)
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -816,7 +855,7 @@ func TestProcessTask_CommentExcludesSessionLineAndVerdictLine(t *testing.T) {
 	cu := &fakeClickUp{task: task}
 	raw := "ИТОГ: критичных=0 важных=0 минор=0 статус=pass"
 	runner := &fakeRunner{
-		specExists: true,
+		specContent: "spec content",
 		result: review.Result{
 			Output:    "### Замечания\n\nЗамечаний нет.\n\n" + raw,
 			SessionID: "sess-xyz",

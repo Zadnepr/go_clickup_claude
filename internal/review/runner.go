@@ -1,6 +1,7 @@
 package review
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ErrUsageLimit — claude сообщил об исчерпанном лимите использования (usage
@@ -38,22 +40,48 @@ type Runner struct {
 	RepoPath     string
 	Home         string
 	ClaudeBinary string
+	// Model/Effort — флаги --model/--effort (пусто — использовать выбор
+	// claude по умолчанию). См. config.Config.ClaudeModel/ClaudeEffort.
+	Model  string
+	Effort string
 }
 
 // NewRunner создаёт Runner с настоящим бинарником claude.
-func NewRunner(repoPath, home string) *Runner {
-	return &Runner{RepoPath: repoPath, Home: home, ClaudeBinary: "claude"}
+func NewRunner(repoPath, home, model, effort string) *Runner {
+	return &Runner{RepoPath: repoPath, Home: home, ClaudeBinary: "claude", Model: model, Effort: effort}
 }
 
 // Result — итог запуска /review: полный текст ревью, id сессии для лога и
-// ссылки на прогон, stderr процесса (для диагностики), разобранный вердикт
-// и потраченные токены/стоимость именно этого вызова.
+// ссылки на прогон, служебные поля вызова claude (для лога и сохранения
+// в БД, см. store.ClaudeInvocation) и разобранный вердикт.
 type Result struct {
-	Output    string
-	SessionID string
-	Stderr    string
-	Verdict   Verdict
-	Usage     TokenUsage
+	Output     string
+	SessionID  string
+	Stderr     string
+	Subtype    string
+	IsError    bool
+	Verdict    Verdict
+	Usage      TokenUsage
+	Prompt     string
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// SpecResult — итог запуска /spec: содержимое собранного ТЗ (Content —
+// то, что раньше писалось в файл самой командой claude; теперь claude
+// только выводит текст в ответ, а сохраняет его вызывающая сторона —
+// см. Требование «ТЗ хранится в БД, не в файле») плюс те же служебные поля,
+// что и у Result.
+type SpecResult struct {
+	Content    string
+	SessionID  string
+	Stderr     string
+	Subtype    string
+	IsError    bool
+	Usage      TokenUsage
+	Prompt     string
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // TokenUsage — токены и стоимость одного вызова `claude -p`. Складывается
@@ -74,7 +102,9 @@ func (u TokenUsage) Add(o TokenUsage) TokenUsage {
 	}
 }
 
-// claudeJSONResult отражает нужные поля вывода `claude -p --output-format json`.
+// claudeJSONResult отражает нужные поля финальной строки `claude -p
+// --output-format stream-json` (type="result") — по форме совпадает с тем,
+// что раньше отдавал --output-format json целиком.
 type claudeJSONResult struct {
 	Type         string      `json:"type"`
 	Subtype      string      `json:"subtype"`
@@ -167,108 +197,209 @@ func isGitRepo(dir string) bool {
 	return err == nil
 }
 
-// SpecFilePath возвращает путь, по которому /spec обязан сохранить ТЗ задачи.
+// SpecFilePath возвращает путь, по которому вызывающая сторона обязана
+// сохранить ТЗ задачи, собранное /spec (см. Требование: ТЗ хранится в БД —
+// БД является источником истины, этот файл — производный от неё артефакт,
+// нужный только затем, что /review читает ТЗ из файла тулом Read).
 //
 // Каталог специально НЕ внутри .claude/: Claude Code относит всё под
 // .claude/ к чувствительным путям и блокирует запись в них тулом Write
-// независимо от --allowedTools (проверено эмпирически — ни широкое "Write",
-// ни точечный паттерн "Write(.claude/specs/**)" разрешения не дают). Обычная
-// директория specs/ в корне рабочей копии под то же ограничение не подпадает.
+// независимо от --allowedTools (проверено эмпирически). Здесь это уже не
+// имеет значения для самого /spec (он больше не пишет файл — это делает Go
+// через os.WriteFile), но /review по-прежнему ищет готовый документ по
+// этому пути, поэтому каталог остаётся прежним.
 func (r *Runner) SpecFilePath(taskID string) string {
 	return filepath.Join(r.RepoPath, "specs", taskID+".md")
 }
 
-// RunSpec запускает "/spec\n<url задачи>" отдельной сессией claude. Команда
-// сама пишет specs/<ID>.md — вызывающая сторона проверяет файл
-// после возврата (см. RunSpec в очереди задач и Требование 5.2).
-func (r *Runner) RunSpec(ctx context.Context, taskURL string) (sessionID string, usage TokenUsage, err error) {
+// RunSpec запускает "/spec\n<url задачи>" отдельной сессией claude и
+// возвращает собранное ТЗ как обычный текст ответа — команда больше не
+// сохраняет файл сама (см. .claude/commands/spec.md, раздел 6): сохранение
+// в БД и на диск делает вызывающая сторона (см. queue.stageSpec).
+func (r *Runner) RunSpec(ctx context.Context, taskURL string, onUsage func(TokenUsage)) (SpecResult, error) {
 	prompt := "/spec\n" + taskURL
-	result, stderr, err := r.run(ctx, prompt)
-	if err != nil {
-		return result.SessionID, result.tokenUsage(), fmt.Errorf("/spec run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
+	started := time.Now()
+	result, stderr, err := r.run(ctx, prompt, onUsage)
+	sr := SpecResult{
+		Content: result.Result, SessionID: result.SessionID, Stderr: stderr,
+		Subtype: result.Subtype, IsError: result.IsError, Usage: result.tokenUsage(),
+		Prompt: prompt, StartedAt: started, FinishedAt: time.Now(),
 	}
-	return result.SessionID, result.tokenUsage(), nil
+	if err != nil {
+		return sr, fmt.Errorf("/spec run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
+	}
+	return sr, nil
 }
 
 // RunReview запускает "/review\n<url задачи>[\n<путь к спеке>]" отдельной
 // сессией claude и возвращает полный вывод, id сессии и разобранный вердикт.
-// specPath пустой означает, что /spec не создал файл: /review соберёт ТЗ сама.
-func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string) (Result, error) {
+// specPath пустой означает, что готового ТЗ нет: /review соберёт его сама.
+func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string, onUsage func(TokenUsage)) (Result, error) {
 	prompt := "/review\n" + taskURL
 	if specPath != "" {
 		prompt += "\n" + specPath
 	}
 
-	result, stderr, err := r.run(ctx, prompt)
+	started := time.Now()
+	result, stderr, err := r.run(ctx, prompt, onUsage)
+	res := Result{
+		SessionID: result.SessionID, Stderr: stderr, Subtype: result.Subtype, IsError: result.IsError,
+		Usage: result.tokenUsage(), Prompt: prompt, StartedAt: started, FinishedAt: time.Now(),
+	}
 	if err != nil {
-		return Result{
-			SessionID: result.SessionID,
-			Stderr:    stderr,
-			Verdict:   Verdict{Status: StatusBlocked},
-			Usage:     result.tokenUsage(),
-		}, fmt.Errorf("/review run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
+		res.Verdict = Verdict{Status: StatusBlocked}
+		return res, fmt.Errorf("/review run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
 	}
 
-	return Result{
-		Output:    result.Result,
-		SessionID: result.SessionID,
-		Stderr:    stderr,
-		Verdict:   ParseVerdict(result.Result),
-		Usage:     result.tokenUsage(),
-	}, nil
+	res.Output = result.Result
+	res.Verdict = ParseVerdict(result.Result)
+	return res, nil
 }
 
-// run выполняет один процесс claude -p и возвращает разобранный JSON-вывод.
-func (r *Runner) run(ctx context.Context, prompt string) (claudeJSONResult, string, error) {
+// streamEventHead — только то, что нужно, чтобы понять тип строки потокового
+// вывода claude (--output-format stream-json), не разбирая её целиком.
+type streamEventHead struct {
+	Type string `json:"type"`
+}
+
+// streamAssistantUsage — промежуточное потребление токенов одного сообщения
+// ассистента внутри сессии. Используется для обновления расхода токенов
+// в БД по ходу выполнения, до завершения всего вызова claude (Требование:
+// видеть расход токенов в реальном времени, а не только по окончании этапа).
+type streamAssistantUsage struct {
+	Message struct {
+		Usage claudeUsage `json:"usage"`
+	} `json:"message"`
+}
+
+// usageReportInterval — не чаще какого интервала дёргать onUsage: сообщения
+// ассистента могут идти пачками (в частности, при использовании инструментов),
+// а каждый вызов onUsage — это, как правило, запись в БД; ограничение
+// оставляет ощущение "почти реального времени", не создавая паразитную
+// нагрузку на единственное соединение к SQLite.
+const usageReportInterval = 2 * time.Second
+
+// run выполняет один процесс claude -p в потоковом режиме и возвращает
+// разобранную финальную строку ("result"). onUsage (может быть nil)
+// вызывается по ходу выполнения с токенами, потреблёнными до этого момента
+// сессии, — это и есть отслеживание расхода в реальном времени; финальные
+// точные цифры (включая стоимость) всё равно берутся из результирующей
+// строки после завершения процесса.
+func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage)) (claudeJSONResult, string, error) {
 	binary := r.ClaudeBinary
 	if binary == "" {
 		binary = "claude"
 	}
 
 	// Список — объединение allowed-tools обеих команд (.claude/commands/spec.md
-	// и review.md): /spec нужен Write, чтобы сохранить файл ТЗ, обеим нужен
-	// Bash(notion-cli:*) для сбора ТЗ из Notion. Без этого claude отрабатывает
-	// сессию до конца (is_error=false), просто не сохраняя файл — что выглядит
-	// как "всё прошло успешно", хотя по факту команда была лишена инструмента.
-	cmd := exec.CommandContext(ctx, binary, "-p", prompt,
-		"--output-format", "json",
-		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Bash(notion-cli:*)", "Read", "Grep", "Glob", "Write")
+	// и review.md): обеим нужен Bash(notion-cli:*) для сбора ТЗ из Notion.
+	// Write здесь больше не нужен — ни /spec, ни /review не пишут файлы сами
+	// (см. SpecFilePath и .claude/commands/spec.md, раздел 6): наименьший
+	// достаточный набор прав для пайплайна, обрабатывающего непроверенное
+	// содержимое задач ClickUp.
+	args := []string{"-p", prompt,
+		"--output-format", "stream-json", "--verbose",
+		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Bash(notion-cli:*)", "Read", "Grep", "Glob"}
+	if r.Model != "" {
+		args = append(args, "--model", r.Model)
+	}
+	if r.Effort != "" {
+		args = append(args, "--effort", r.Effort)
+	}
+
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = r.RepoPath
 	// os.Environ() дополняется, а не заменяется: иначе claude не увидит
 	// CLAUDE_CODE_OAUTH_TOKEN и упадёт на авторизации.
 	cmd.Env = append(os.Environ(), "HOME="+r.Home)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return claudeJSONResult{}, "", fmt.Errorf("open claude stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
 
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return claudeJSONResult{}, "", fmt.Errorf("start claude process: %w", err)
+	}
 
-	var result claudeJSONResult
-	if parseErr := json.Unmarshal(stdout.Bytes(), &result); parseErr != nil {
-		if runErr != nil {
-			if isUsageLimitMessage(stderr.String()) {
-				return claudeJSONResult{}, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(stderr.String(), 500))
-			}
-			return claudeJSONResult{}, stderr.String(), fmt.Errorf("claude process failed: %w", runErr)
+	var final claudeJSONResult
+	var haveFinal bool
+	var lastReport time.Time
+
+	scanner := bufio.NewScanner(stdout)
+	// Строка потокового вывода — это, в частности, целиком текст итогового
+	// ревью; дефолтный буфер bufio.Scanner (64KiB) на нём переполняется.
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
 		}
-		return claudeJSONResult{}, stderr.String(), fmt.Errorf("parse claude json output: %w (raw: %s)", parseErr, truncate(stdout.String(), 2000))
+
+		var head streamEventHead
+		if err := json.Unmarshal(line, &head); err != nil {
+			continue
+		}
+
+		switch head.Type {
+		case "result":
+			json.Unmarshal(line, &final)
+			haveFinal = true
+		case "assistant":
+			if onUsage == nil {
+				continue
+			}
+			var evt streamAssistantUsage
+			if err := json.Unmarshal(line, &evt); err != nil {
+				continue
+			}
+			if evt.Message.Usage.InputTokens == 0 && evt.Message.Usage.OutputTokens == 0 {
+				continue
+			}
+			if time.Since(lastReport) < usageReportInterval {
+				continue
+			}
+			lastReport = time.Now()
+			onUsage(TokenUsage{
+				InputTokens:  evt.Message.Usage.InputTokens,
+				OutputTokens: evt.Message.Usage.OutputTokens,
+			})
+		}
+	}
+	scanErr := scanner.Err()
+	runErr := cmd.Wait()
+	stderr := stderrBuf.String()
+
+	if !haveFinal {
+		if runErr != nil {
+			if isUsageLimitMessage(stderr) {
+				return claudeJSONResult{}, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(stderr, 500))
+			}
+			return claudeJSONResult{}, stderr, fmt.Errorf("claude process failed: %w", runErr)
+		}
+		detail := "no result event in claude output"
+		if scanErr != nil {
+			detail = scanErr.Error()
+		}
+		return claudeJSONResult{}, stderr, fmt.Errorf("parse claude json output: %s", detail)
 	}
 
 	if runErr != nil {
-		if isUsageLimitMessage(result.Result) || isUsageLimitMessage(stderr.String()) {
-			return result, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(result.Result, 500))
+		if isUsageLimitMessage(final.Result) || isUsageLimitMessage(stderr) {
+			return final, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
 		}
-		return result, stderr.String(), fmt.Errorf("claude process failed: %w", runErr)
+		return final, stderr, fmt.Errorf("claude process failed: %w", runErr)
 	}
-	if result.IsError {
-		if isUsageLimitMessage(result.Result) {
-			return result, stderr.String(), fmt.Errorf("%w: %s", ErrUsageLimit, truncate(result.Result, 500))
+	if final.IsError {
+		if isUsageLimitMessage(final.Result) {
+			return final, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
 		}
-		return result, stderr.String(), fmt.Errorf("claude reported an error: %s", result.Result)
+		return final, stderr, fmt.Errorf("claude reported an error: %s", final.Result)
 	}
 
-	return result, stderr.String(), nil
+	return final, stderr, nil
 }
 
 func truncate(s string, n int) string {

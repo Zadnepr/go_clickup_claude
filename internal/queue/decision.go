@@ -16,11 +16,11 @@ import (
 // (ревью не смогло выполниться) — оба случая уходят в STATUS_FAIL: п.3
 // Требования 3 явно объединяет их в одном переходе.
 //
-// originalAssignees — исполнители, которые были на задаче до того, как
-// воркер снял их на время проверки (см. Требование «снять асайны на время
-// проверки»); при провале они переназначаются обратно, если ASSIGNEE_ON_FAIL
-// не задан явно.
-func Decide(v review.Verdict, cfg *config.Config, creatorID int, originalAssignees []int) (targetStatus string, assigneeIDs []int) {
+// developerIDs — значение custom field "Developer" на задаче (тип "users"
+// в ClickUp): при провале это самый приоритетный источник исполнителя —
+// именно тот разработчик, который реально должен доработать задачу, а не
+// снятый на время проверки исполнитель (им мог быть, например, QA).
+func Decide(v review.Verdict, cfg *config.Config, creatorID int, developerIDs []int) (targetStatus string, assigneeIDs []int) {
 	if v.Status == review.StatusPass {
 		if id, ok := parseUserID(cfg.AssigneeOnPass); ok {
 			assigneeIDs = []int{id}
@@ -28,10 +28,14 @@ func Decide(v review.Verdict, cfg *config.Config, creatorID int, originalAssigne
 		return cfg.StatusPass, assigneeIDs
 	}
 
-	if id, ok := parseUserID(cfg.AssigneeOnFail); ok {
+	// Приоритет при провале: custom field "Developer" → ASSIGNEE_ON_FAIL →
+	// ASSIGNEE_ON_PASS → создатель задачи.
+	if len(developerIDs) > 0 {
+		assigneeIDs = append(assigneeIDs, developerIDs...)
+	} else if id, ok := parseUserID(cfg.AssigneeOnFail); ok {
 		assigneeIDs = []int{id}
-	} else if len(originalAssignees) > 0 {
-		assigneeIDs = append(assigneeIDs, originalAssignees...)
+	} else if id, ok := parseUserID(cfg.AssigneeOnPass); ok {
+		assigneeIDs = []int{id}
 	} else if creatorID != 0 {
 		assigneeIDs = []int{creatorID}
 	}

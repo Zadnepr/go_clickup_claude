@@ -33,6 +33,12 @@ type Config struct {
 	Port                 int
 	DBPath               string
 	Home                 string
+	// ClaudeModel/ClaudeEffort — модель и уровень усилий для каждого вызова
+	// `claude -p` (флаги --model/--effort). По умолчанию — sonnet/high, но
+	// на время обкатки функционала можно временно выставить в .env более
+	// дешёвую/быструю пару (например haiku/low), не трогая код.
+	ClaudeModel  string
+	ClaudeEffort string
 }
 
 // Load читает конфигурацию через getenv (os.Getenv в проде, произвольная map в тестах)
@@ -72,6 +78,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		AssigneeOnPass:  getenv("ASSIGNEE_ON_PASS"),
 		DBPath:          withDefault(getenv("DB_PATH"), "/data/state.db"),
 		Home:            getenv("HOME"),
+		ClaudeModel:     withDefault(getenv("CLAUDE_MODEL"), "sonnet"),
+		ClaudeEffort:    withDefault(getenv("CLAUDE_EFFORT"), "high"),
 	}
 
 	cfg.WorkerConcurrency = parseIntDefault(getenv("WORKER_CONCURRENCY"), 1, "WORKER_CONCURRENCY", &problems)

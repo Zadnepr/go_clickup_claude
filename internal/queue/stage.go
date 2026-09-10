@@ -34,12 +34,20 @@ type setupData struct {
 }
 
 // specStageData — результат /spec, сохранённый в run_stages: id сессии
-// claude, путь к файлу ТЗ (пусто, если /spec не смогла его создать) и
-// потраченные токены. При возобновлении /spec не запускается повторно —
-// используется этот сохранённый результат.
+// claude, содержимое собранного ТЗ и id, под которым оно будет сохранено на
+// диск для /review (SpecID — CustomID задачи или, если его нет, нативный
+// ID; см. specFileID). Content пуст, если /spec не смогла собрать ТЗ.
+//
+// Само ТЗ хранится здесь, в БД, а не в файле (Требование: «ТЗ сохранялось
+// не в файл, а в базу данных ... и использовалось из базы для проверки
+// задач») — файл под SpecFilePath(SpecID), который читает /review,
+// является производным и перезаписывается из этого поля перед каждым
+// запуском /review (см. ensureSpecFile), в том числе при возобновлении
+// прогона в свежем контейнере, где рабочая копия могла быть создана заново.
 type specStageData struct {
 	SessionID string            `json:"session_id"`
-	SpecPath  string            `json:"spec_path"`
+	SpecID    string            `json:"spec_id"`
+	Content   string            `json:"content"`
 	Usage     review.TokenUsage `json:"usage"`
 }
 

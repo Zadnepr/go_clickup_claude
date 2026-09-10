@@ -104,7 +104,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	defer cuClient.Close()
 
 	notifier := slack.NewNotifier(cfg.SlackWebhookURL)
-	runner := review.NewRunner(cfg.RepoPath, cfg.Home)
+	runner := review.NewRunner(cfg.RepoPath, cfg.Home, cfg.ClaudeModel, cfg.ClaudeEffort)
 
 	q := queue.New(queue.Deps{
 		ClickUp: cuClient,

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -85,6 +86,12 @@ type Task struct {
 	ListID            string
 	CreatorID         int
 	Assignees         []int
+	// DeveloperIDs — значение custom field "Developer" (тип "users" в
+	// ClickUp), если такое поле есть на задаче и заполнено. Приоритетный
+	// источник исполнителя при провале ревью (см. queue.Decide) — это
+	// реальный разработчик, а не тот, кто был назначен на задачу до снятия
+	// исполнителей на время проверки.
+	DeveloperIDs []int
 }
 
 type apiError struct {
@@ -202,6 +209,48 @@ type rawTask struct {
 	Assignees []struct {
 		ID int `json:"id"`
 	} `json:"assignees"`
+	CustomFields []rawCustomField `json:"custom_fields"`
+}
+
+// rawCustomField отражает один custom field из ответа GET /task/{id}. Value
+// не разбирается здесь целиком: форма поля зависит от его типа (дата — число
+// строкой, dropdown — индекс, users — массив объектов и т.д.), поэтому
+// парсится только там, где по имени/типу поля точно известно, чего ожидать
+// (см. developerIDsFromCustomFields).
+type rawCustomField struct {
+	Name  string          `json:"name"`
+	Type  string          `json:"type"`
+	Value json.RawMessage `json:"value"`
+}
+
+// developerFieldName — имя custom field в ClickUp, откуда берётся реальный
+// исполнитель при провале ревью (см. queue.Decide). Сравнивается без учёта
+// регистра — то же соглашение, что и для статусов/тегов (см.
+// config.NormalizeStatus).
+const developerFieldName = "developer"
+
+// developerIDsFromCustomFields ищет среди custom fields задачи поле
+// "Developer" (тип "users") и возвращает id всех выбранных в нём
+// пользователей. Поля другого типа с тем же именем или отсутствие поля —
+// пустой результат, не ошибка: не на каждой задаче/списке оно обязано быть.
+func developerIDsFromCustomFields(fields []rawCustomField) []int {
+	for _, f := range fields {
+		if strings.ToLower(strings.TrimSpace(f.Name)) != developerFieldName || f.Type != "users" || len(f.Value) == 0 {
+			continue
+		}
+		var users []struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal(f.Value, &users); err != nil {
+			continue
+		}
+		ids := make([]int, 0, len(users))
+		for _, u := range users {
+			ids = append(ids, u.ID)
+		}
+		return ids
+	}
+	return nil
 }
 
 // GetTask загружает полную карточку задачи по её ID.
@@ -217,13 +266,14 @@ func (c *Client) GetTask(ctx context.Context, taskID string) (*Task, error) {
 	}
 
 	task := &Task{
-		ID:        raw.ID,
-		CustomID:  raw.CustomID,
-		Name:      raw.Name,
-		URL:       raw.URL,
-		Status:    raw.Status.Status,
-		ListID:    raw.List.ID,
-		CreatorID: raw.Creator.ID,
+		ID:           raw.ID,
+		CustomID:     raw.CustomID,
+		Name:         raw.Name,
+		URL:          raw.URL,
+		Status:       raw.Status.Status,
+		ListID:       raw.List.ID,
+		CreatorID:    raw.Creator.ID,
+		DeveloperIDs: developerIDsFromCustomFields(raw.CustomFields),
 	}
 	for _, t := range raw.Tags {
 		task.Tags = append(task.Tags, t.Name)

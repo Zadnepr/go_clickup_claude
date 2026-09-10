@@ -482,6 +482,106 @@ func TestFailStage_MarksFailedNotDone(t *testing.T) {
 	}
 }
 
+func TestRecordInvocation_StoresFullRequestAndResponse(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	runID, _, err := s.TryEnqueue(ctx, "task-invocation")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+
+	started := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	finished := time.Now().UTC().Truncate(time.Second)
+	inv := ClaudeInvocation{
+		RunID: runID, Stage: "spec", SessionID: "sess-1", Model: "haiku", Effort: "low",
+		Prompt: "/spec\nhttps://...", Output: "собранное ТЗ", Stderr: "", Subtype: "success", IsError: false,
+		InputTokens: 100, OutputTokens: 20, CostUSD: 0.005, StartedAt: started, FinishedAt: finished,
+	}
+	id, err := s.RecordInvocation(ctx, inv)
+	if err != nil {
+		t.Fatalf("RecordInvocation error: %v", err)
+	}
+	if id == 0 {
+		t.Fatal("expected a non-zero invocation id")
+	}
+
+	invocations, err := s.ListInvocations(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListInvocations error: %v", err)
+	}
+	if len(invocations) != 1 {
+		t.Fatalf("expected 1 invocation, got %d", len(invocations))
+	}
+	got := invocations[0]
+	if got.SessionID != "sess-1" || got.Model != "haiku" || got.Effort != "low" {
+		t.Errorf("unexpected metadata: %+v", got)
+	}
+	if got.Prompt != inv.Prompt || got.Output != inv.Output {
+		t.Errorf("expected full prompt/output to round-trip, got: %+v", got)
+	}
+	if got.InputTokens != 100 || got.OutputTokens != 20 || got.CostUSD != 0.005 {
+		t.Errorf("unexpected token usage: %+v", got)
+	}
+	if !got.StartedAt.Equal(started) || !got.FinishedAt.Equal(finished) {
+		t.Errorf("unexpected timestamps: started=%v finished=%v", got.StartedAt, got.FinishedAt)
+	}
+}
+
+func TestListInvocations_OrderedChronologically(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	runID, _, err := s.TryEnqueue(ctx, "task-invocation-order")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+
+	for _, stage := range []string{"spec", "review"} {
+		if _, err := s.RecordInvocation(ctx, ClaudeInvocation{
+			RunID: runID, Stage: stage, StartedAt: time.Now(), FinishedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("RecordInvocation(%s) error: %v", stage, err)
+		}
+	}
+
+	invocations, err := s.ListInvocations(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListInvocations error: %v", err)
+	}
+	if len(invocations) != 2 || invocations[0].Stage != "spec" || invocations[1].Stage != "review" {
+		t.Fatalf("expected [spec review] in order, got: %+v", invocations)
+	}
+}
+
+func TestUpdateRunningUsage_UpdatesWithoutChangingStatus(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	runID, _, err := s.TryEnqueue(ctx, "task-live-usage")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	if err := s.MarkRunning(ctx, runID); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+
+	if err := s.UpdateRunningUsage(ctx, runID, Usage{InputTokens: 1000, OutputTokens: 200, CostUSD: 0.02}); err != nil {
+		t.Fatalf("UpdateRunningUsage error: %v", err)
+	}
+
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != StatusRunning {
+		t.Errorf("expected status to stay running, got %q", run.Status)
+	}
+	if run.InputTokens != 1000 || run.OutputTokens != 200 || run.CostUSD != 0.02 {
+		t.Errorf("unexpected live usage: %+v", run)
+	}
+}
+
 func TestMigrateTokenColumns_IdempotentOnReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 

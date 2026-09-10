@@ -18,6 +18,12 @@ import (
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
+// maxLoggedOutput — предел размера ответа claude в структурированном логе
+// (Требование: «писать ответы claude в лог»). Полный ответ без обрезки
+// всегда доступен в БД (см. store.ClaudeInvocation) — предел здесь только
+// для того, чтобы один ответ ревью на большой PR не забивал журнал сервиса.
+const maxLoggedOutput = 8000
+
 // requiredCommands — slash-команды, без которых /spec и /review не смогут
 // отработать содержательно; проверяются перед запуском claude.
 var requiredCommands = []string{"spec.md", "review.md"}
@@ -36,8 +42,12 @@ type ClickUp interface {
 // Runner — часть API запуска claude, нужная воркеру очереди.
 type Runner interface {
 	GitFetch(ctx context.Context) error
-	RunSpec(ctx context.Context, taskURL string) (sessionID string, usage review.TokenUsage, err error)
-	RunReview(ctx context.Context, taskURL, specPath string) (review.Result, error)
+	RunSpec(ctx context.Context, taskURL string, onUsage func(review.TokenUsage)) (review.SpecResult, error)
+	RunReview(ctx context.Context, taskURL, specPath string, onUsage func(review.TokenUsage)) (review.Result, error)
+	// SpecFilePath — путь, по которому нужно сохранить (не сама /spec —
+	// см. Queue.runReview) содержимое собранного ТЗ, чтобы /review могла
+	// прочитать его тулом Read. Источник истины для этого содержимого —
+	// БД (specStageData.Content), файл — лишь производный от неё артефакт.
 	SpecFilePath(taskID string) string
 }
 
@@ -73,16 +83,18 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 	return config.NormalizeStatus(task.Status) == config.NormalizeStatus(cfg.StatusTrigger)
 }
 
-// specFileCandidateIDs возвращает ID, по которым /spec могла сохранить файл
-// ТЗ, в порядке приоритета. /spec называет файл `specs/<ID задачи>.md`,
-// и на практике команда предпочитает человекочитаемый custom_id (например,
-// "PNL-4528"), если он у задачи задан — иначе использует нативный ID ClickUp.
-// Проверяем оба варианта, чтобы не промахнуться мимо реально созданного файла.
-func specFileCandidateIDs(task *clickup.Task) []string {
+// specFileID возвращает ID задачи, под которым сохраняется файл ТЗ
+// (`specs/<ID>.md`, см. Runner.SpecFilePath): человекочитаемый custom_id
+// (например, "PNL-4528"), если он у задачи задан, иначе нативный ID ClickUp.
+// В отличие от прежней версии (когда /spec сама писала файл и приходилось
+// угадывать, каким именем она его назвала) Go теперь пишет этот файл сам
+// из содержимого, сохранённого в БД, — поэтому имя выбирается детерминированно,
+// без перебора кандидатов.
+func specFileID(task *clickup.Task) string {
 	if task.CustomID != "" {
-		return []string{task.CustomID, task.ID}
+		return task.CustomID
 	}
-	return []string{task.ID}
+	return task.ID
 }
 
 // missingCommands проверяет наличие .claude/commands/{spec,review}.md в
@@ -245,22 +257,26 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	spec, _, specErr := stageRun(ctx, q, log, runID, stageSpec, func() (specStageData, error) {
-		sessionID, usage, err := q.deps.Runner.RunSpec(ctx, task.URL)
+		sr, err := q.deps.Runner.RunSpec(ctx, task.URL, func(u review.TokenUsage) {
+			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(u))
+		})
+		q.logAndRecordInvocation(ctx, log, runID, stageSpec, invocationLog{
+			SessionID: sr.SessionID, Prompt: sr.Prompt, Output: sr.Content, Stderr: sr.Stderr,
+			Subtype: sr.Subtype, IsError: sr.IsError, Usage: sr.Usage,
+			StartedAt: sr.StartedAt, FinishedAt: sr.FinishedAt,
+		})
 		if err != nil {
-			return specStageData{SessionID: sessionID, Usage: usage}, err
+			return specStageData{SessionID: sr.SessionID, Usage: sr.Usage}, err
 		}
 
-		specPath := ""
-		for _, id := range specFileCandidateIDs(task) {
-			if _, statErr := os.Stat(q.deps.Runner.SpecFilePath(id)); statErr == nil {
-				specPath = filepath.Join("specs", id+".md")
-				break
-			}
+		content := strings.TrimSpace(sr.Content)
+		specID := ""
+		if content != "" {
+			specID = specFileID(task)
+		} else {
+			log.Warn("/spec did not return any ТЗ content, running /review with the task link only")
 		}
-		if specPath == "" {
-			log.Warn("/spec did not produce a spec file, running /review with the task link only")
-		}
-		return specStageData{SessionID: sessionID, SpecPath: specPath, Usage: usage}, nil
+		return specStageData{SessionID: sr.SessionID, SpecID: specID, Content: content, Usage: sr.Usage}, nil
 	})
 	if errors.Is(specErr, review.ErrUsageLimit) {
 		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, spec.SessionID, specErr, spec.Usage)
@@ -271,8 +287,23 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 			"error", specErr.Error(), "spec_session_id", spec.SessionID)
 	}
 
+	// ТЗ хранится в БД (specStageData.Content), а не в файле — файл здесь
+	// лишь производный артефакт, который читает /review тулом Read.
+	// Перезаписывается из БД перед КАЖДЫМ запуском /review, в том числе при
+	// возобновлении прогона (см. Store.ReopenOrEnqueue): рабочая копия
+	// репозитория в новом контейнере может не содержать файла, который был
+	// записан предыдущим (см. ensureSpecFile).
+	specPath := q.ensureSpecFile(log, spec)
+
 	reviewData, _, reviewErr := stageRun(ctx, q, log, runID, stageReview, func() (reviewStageData, error) {
-		result, err := q.deps.Runner.RunReview(ctx, task.URL, spec.SpecPath)
+		result, err := q.deps.Runner.RunReview(ctx, task.URL, specPath, func(u review.TokenUsage) {
+			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(spec.Usage.Add(u)))
+		})
+		q.logAndRecordInvocation(ctx, log, runID, stageReview, invocationLog{
+			SessionID: result.SessionID, Prompt: result.Prompt, Output: result.Output, Stderr: result.Stderr,
+			Subtype: result.Subtype, IsError: result.IsError, Usage: result.Usage,
+			StartedAt: result.StartedAt, FinishedAt: result.FinishedAt,
+		})
 		return reviewStageData{SessionID: result.SessionID, Output: result.Output, Stderr: result.Stderr, Usage: result.Usage}, err
 	})
 	totalUsage := spec.Usage.Add(reviewData.Usage)
@@ -313,7 +344,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	var assigneeIDs []int
 	if reviewErr == nil {
 		decide, _, _ := stageRun(ctx, q, log, runID, stageDecide, func() (decideStageData, error) {
-			ts, ids := Decide(verdict, cfg, task.CreatorID, originalAssignees)
+			ts, ids := Decide(verdict, cfg, task.CreatorID, task.DeveloperIDs)
 
 			if ts != "" {
 				if err := q.deps.ClickUp.SetStatus(ctx, task.ID, ts); err != nil {
@@ -406,6 +437,78 @@ func storeUsage(u review.TokenUsage) store.Usage {
 		OutputTokens: int64(u.OutputTokens),
 		CostUSD:      u.CostUSD,
 	}
+}
+
+// ensureSpecFile перезаписывает файл ТЗ на диске из содержимого, сохранённого
+// в БД (specStageData.Content), и возвращает относительный путь для передачи
+// /review, либо "" если содержимого нет. БД — источник истины (Требование:
+// «ТЗ сохранялось в базу и использовалось из базы»); файл — восстанавливаемый
+// из неё артефакт, нужный только затем, что /review читает его тулом Read.
+// Вызывается перед каждым запуском /review, в том числе при возобновлении —
+// рабочая копия репозитория в новом контейнере могла не унаследовать файл,
+// записанный предыдущим экземпляром сервиса.
+func (q *Queue) ensureSpecFile(log *slog.Logger, spec specStageData) string {
+	if spec.Content == "" || spec.SpecID == "" {
+		return ""
+	}
+
+	absPath := q.deps.Runner.SpecFilePath(spec.SpecID)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		log.Error("failed to create specs directory, running /review with the task link only", "error", err.Error())
+		return ""
+	}
+	if err := os.WriteFile(absPath, []byte(spec.Content), 0o644); err != nil {
+		log.Error("failed to write spec file from stored content, running /review with the task link only", "error", err.Error())
+		return ""
+	}
+	return filepath.Join("specs", spec.SpecID+".md")
+}
+
+// invocationLog — общий вид одного вызова claude (что для /spec, что для
+// /review), нужный только для логирования и сохранения в БД (см.
+// Queue.logAndRecordInvocation) — отдельно от review.Result/SpecResult,
+// чтобы не завязывать это на конкретный из двух типов.
+type invocationLog struct {
+	SessionID  string
+	Prompt     string
+	Output     string
+	Stderr     string
+	Subtype    string
+	IsError    bool
+	Usage      review.TokenUsage
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// logAndRecordInvocation пишет полный ответ claude в лог сервиса (обрезая
+// длинный текст — сам ответ без обрезки всегда доступен в БД) и сохраняет
+// вызов целиком в claude_invocations (Требование: «лог процесса работы
+// claude ... с токенами на этот этап. И чтобы ответ всей сессии тоже
+// писался в таблицу»). Ошибки самой записи не прерывают прогон — потерять
+// строку лога менее важно, чем результат ревью.
+func (q *Queue) logAndRecordInvocation(ctx context.Context, log *slog.Logger, runID int64, stage string, inv invocationLog) {
+	log.Info("claude response",
+		"stage", stage, "session_id", inv.SessionID, "subtype", inv.Subtype, "is_error", inv.IsError,
+		"input_tokens", inv.Usage.InputTokens, "output_tokens", inv.Usage.OutputTokens, "cost_usd", inv.Usage.CostUSD,
+		"duration", inv.FinishedAt.Sub(inv.StartedAt).Round(time.Second),
+		"output", truncateOutputForLog(inv.Output))
+
+	cfg := q.deps.Cfg
+	if _, err := q.deps.Store.RecordInvocation(ctx, store.ClaudeInvocation{
+		RunID: runID, Stage: stage, SessionID: inv.SessionID, Model: cfg.ClaudeModel, Effort: cfg.ClaudeEffort,
+		Prompt: inv.Prompt, Output: inv.Output, Stderr: inv.Stderr, Subtype: inv.Subtype, IsError: inv.IsError,
+		InputTokens: int64(inv.Usage.InputTokens), OutputTokens: int64(inv.Usage.OutputTokens), CostUSD: inv.Usage.CostUSD,
+		StartedAt: inv.StartedAt, FinishedAt: inv.FinishedAt,
+	}); err != nil {
+		log.Error("failed to record claude invocation", "stage", stage, "error", err.Error())
+	}
+}
+
+func truncateOutputForLog(s string) string {
+	if len(s) <= maxLoggedOutput {
+		return s
+	}
+	return s[:maxLoggedOutput] + "...(truncated, полный текст — в таблице claude_invocations)"
 }
 
 // postComment публикует полный текст ревью, при необходимости разбивая его

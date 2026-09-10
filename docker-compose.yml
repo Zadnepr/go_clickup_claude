@@ -11,33 +11,23 @@ services:
     # попавший на активный прогон, обрывает его SIGKILL'ом посреди работы.
     # Если меняете REVIEW_TIMEOUT — увеличьте и это значение (с запасом).
     stop_grace_period: 16m
+    # env_file, а не перечисление "- VAR" под environment: у бесзначного
+    # "- VAR" Docker Compose приоритет отдаёт переменной ИЗ ШЕЛЛА, в котором
+    # запущен `docker compose`, а .env — только запасной вариант. Для имён
+    # вроде CLAUDE_MODEL/CLAUDE_EFFORT это реальная ловушка: сама Claude Code
+    # CLI экспортирует такие переменные в своих собственных сессиях — если
+    # `docker compose up` запущен из-под неё, то, что задано в .env, молча
+    # подменяется тем, что нашлось в шелле (проверено эмпирически при
+    # обкатке этого функционала). env_file читает файл напрямую, минуя
+    # окружение шелла, и этой подмене не подвержен.
+    env_file:
+      - .env
     environment:
-      # Значения не перечислены — подтягиваются из .env (docker compose
-      # делает это автоматически для переменных без значения).
-      - CLAUDE_CODE_OAUTH_TOKEN
-      - CU_API_TOKEN
-      - CU_TEAM_ID
-      - CU_LIST_ID
-      - CU_WEBHOOK_SECRET
-      - SLACK_WEBHOOK_URL
-      - REPO_PATH
-      - REPO_URL
-      - TRIGGER_TAG
-      - STATUS_TRIGGER
-      - STATUS_RUNNING
-      - STATUS_PASS
-      - STATUS_FAIL
-      - ASSIGNEE_ON_FAIL
-      - ASSIGNEE_ON_PASS
-      - WORKER_CONCURRENCY
-      - REVIEW_TIMEOUT
-      - RECONCILE_INTERVAL
-      - USAGE_LIMIT_PAUSE
-      - PORT
-      - DB_PATH
       # SSH-агент хоста форвардится в контейнер (см. volumes ниже) — git
       # внутри контейнера аутентифицируется теми же ключами, что и на хосте,
-      # сами приватные ключи в контейнер не копируются.
+      # сами приватные ключи в контейнер не копируются. Фиксированное
+      # значение (путь внутри контейнера), а не из .env, поэтому задаётся
+      # отдельно от env_file.
       - SSH_AUTH_SOCK=/ssh-agent
     volumes:
       # ./data вместо именованного тома: на macOS Docker Desktop именованный

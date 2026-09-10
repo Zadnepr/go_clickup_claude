@@ -66,6 +66,64 @@ func TestGetTask(t *testing.T) {
 	}
 }
 
+func TestGetTask_ExtractsDeveloperCustomField(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/task/123":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id":     "123",
+				"name":   "Fix bug",
+				"status": map[string]string{"status": "to check"},
+				"list":   map[string]string{"id": "list1"},
+				"custom_fields": []map[string]any{
+					{"name": "Date developing", "type": "date", "value": "1788224400000"},
+					{"name": "Developer", "type": "users", "value": []map[string]any{
+						{"id": 81838052, "username": "Sergey Ponomarev"},
+					}},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/list/list1":
+			json.NewEncoder(w).Encode(map[string]any{"statuses": []map[string]string{}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	task, err := c.GetTask(context.Background(), "123")
+	if err != nil {
+		t.Fatalf("GetTask error: %v", err)
+	}
+	if len(task.DeveloperIDs) != 1 || task.DeveloperIDs[0] != 81838052 {
+		t.Errorf("DeveloperIDs = %+v, want [81838052]", task.DeveloperIDs)
+	}
+}
+
+func TestGetTask_NoDeveloperCustomField(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/task/123":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id":     "123",
+				"name":   "Fix bug",
+				"status": map[string]string{"status": "to check"},
+				"list":   map[string]string{"id": "list1"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/list/list1":
+			json.NewEncoder(w).Encode(map[string]any{"statuses": []map[string]string{}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	task, err := c.GetTask(context.Background(), "123")
+	if err != nil {
+		t.Fatalf("GetTask error: %v", err)
+	}
+	if len(task.DeveloperIDs) != 0 {
+		t.Errorf("expected no DeveloperIDs when the task has no custom fields, got: %+v", task.DeveloperIDs)
+	}
+}
+
 func TestSetStatus_Success(t *testing.T) {
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut || r.URL.Path != "/task/123" {

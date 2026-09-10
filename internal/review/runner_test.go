@@ -55,7 +55,7 @@ func TestRunner_RunReview_ParsesOutputAndSession(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
+	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
 	if err != nil {
 		t.Fatalf("RunReview error: %v", err)
 	}
@@ -83,15 +83,18 @@ func TestRunner_RunSpec_ReturnsUsage(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	sessionID, usage, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123")
+	sr, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", nil)
 	if err != nil {
 		t.Fatalf("RunSpec error: %v", err)
 	}
-	if sessionID != "spec-sess" {
-		t.Errorf("sessionID = %q, want spec-sess", sessionID)
+	if sr.SessionID != "spec-sess" {
+		t.Errorf("sessionID = %q, want spec-sess", sr.SessionID)
 	}
-	if usage.InputTokens != 500 || usage.OutputTokens != 50 || usage.CostUSD != 0.001 {
-		t.Errorf("unexpected usage: %+v", usage)
+	if sr.Content != "spec written" {
+		t.Errorf("Content = %q, want %q", sr.Content, "spec written")
+	}
+	if sr.Usage.InputTokens != 500 || sr.Usage.OutputTokens != 50 || sr.Usage.CostUSD != 0.001 {
+		t.Errorf("unexpected usage: %+v", sr.Usage)
 	}
 }
 
@@ -117,7 +120,7 @@ func TestRunner_RunReview_ClaudeReportsError(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
 	if err == nil {
 		t.Fatal("expected error when claude reports is_error=true")
 	}
@@ -136,7 +139,7 @@ func TestRunner_RunReview_UsageLimitReached(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
 	if err == nil {
 		t.Fatal("expected error when usage limit is reached")
 	}
@@ -157,7 +160,7 @@ func TestRunner_RunSpec_UsageLimitReached(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, _, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123")
+	_, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", nil)
 	if !errors.Is(err, ErrUsageLimit) {
 		t.Errorf("expected errors.Is(err, ErrUsageLimit), got: %v", err)
 	}
@@ -167,7 +170,7 @@ func TestRunner_RunReview_UnparsableOutput(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, "not json at all", 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "")
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
 	if err == nil {
 		t.Fatal("expected error for unparsable claude output")
 	}
@@ -180,7 +183,7 @@ func TestRunner_RunReview_WithSpecPath(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", r.SpecFilePath("123"))
+	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", r.SpecFilePath("123"), nil)
 	if err != nil {
 		t.Fatalf("RunReview error: %v", err)
 	}

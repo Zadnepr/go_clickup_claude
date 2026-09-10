@@ -50,20 +50,16 @@ func TestIsEligible_WrongStatus(t *testing.T) {
 	}
 }
 
-func TestSpecFileCandidateIDs_PrefersCustomID(t *testing.T) {
+func TestSpecFileID_PrefersCustomID(t *testing.T) {
 	task := &clickup.Task{ID: "869d9kt6a", CustomID: "PNL-4528"}
-	got := specFileCandidateIDs(task)
-	want := []string{"PNL-4528", "869d9kt6a"}
-	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("specFileCandidateIDs = %+v, want %+v", got, want)
+	if got := specFileID(task); got != "PNL-4528" {
+		t.Errorf("specFileID = %q, want %q", got, "PNL-4528")
 	}
 }
 
-func TestSpecFileCandidateIDs_FallsBackToNativeIDWithoutCustomID(t *testing.T) {
+func TestSpecFileID_FallsBackToNativeIDWithoutCustomID(t *testing.T) {
 	task := &clickup.Task{ID: "869d9kt6a"}
-	got := specFileCandidateIDs(task)
-	want := []string{"869d9kt6a"}
-	if len(got) != 1 || got[0] != want[0] {
-		t.Errorf("specFileCandidateIDs = %+v, want %+v", got, want)
+	if got := specFileID(task); got != "869d9kt6a" {
+		t.Errorf("specFileID = %q, want %q", got, "869d9kt6a")
 	}
 }
