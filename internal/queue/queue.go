@@ -113,8 +113,8 @@ func (q *Queue) SubmitResume(taskID string) bool {
 
 // pauseFor ставит всю очередь на паузу минимум до now+d: новые вызовы
 // processTask/resumeTask до этого момента становятся no-op. Повторный вызов
-// с меньшей длительностью паузу не сокращает — например, если /spec и
-// /review одной и той же задачи оба упёрлись в лимит, действует более
+// с меньшей длительностью паузу не сокращает — например, если /spec-go и
+// /review-go одной и той же задачи оба упёрлись в лимит, действует более
 // поздний срок.
 func (q *Queue) pauseFor(d time.Duration, reason string) {
 	q.pauseMu.Lock()

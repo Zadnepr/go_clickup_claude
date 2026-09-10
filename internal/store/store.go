@@ -54,7 +54,7 @@ type Run struct {
 	CostUSD      float64
 }
 
-// Usage — токены и стоимость одного прогона (сумма /spec + /review).
+// Usage — токены и стоимость одного прогона (сумма /spec-go + /review-go).
 type Usage struct {
 	InputTokens  int64
 	OutputTokens int64
@@ -493,7 +493,7 @@ func (s *Store) StartStage(ctx context.Context, runID int64, stage string) error
 
 // FinishStage отмечает этап готовым и сохраняет его результат (data — JSON,
 // например id сессии claude, путь к файлу спеки, вердикт) — это и есть
-// «результат /spec, сохранённый в табличку», который переиспользуется при
+// «результат /spec-go, сохранённый в табличку», который переиспользуется при
 // возобновлении прогона вместо повторного вызова claude (см. Queue.stage).
 func (s *Store) FinishStage(ctx context.Context, runID int64, stage string, data []byte) error {
 	if len(data) == 0 {

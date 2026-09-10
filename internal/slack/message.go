@@ -24,7 +24,7 @@ type ReviewNotification struct {
 
 // BuildStartedMessage формирует сообщение о начале проверки задачи —
 // отправляется сразу после того, как задача взята в работу (переведена в
-// STATUS_RUNNING), до запуска /spec и /review.
+// STATUS_RUNNING), до запуска /spec-go и /review-go.
 func BuildStartedMessage(taskName, taskURL string) (text string, blocks []Block) {
 	text = fmt.Sprintf("🔎 Проверка начата: %s — %s", taskName, taskURL)
 

@@ -81,7 +81,7 @@ func (r *Runner) ModelEffort() (model, effort string) {
 	return r.model, r.effort
 }
 
-// Result — итог запуска /review: полный текст ревью, id сессии для лога и
+// Result — итог запуска /review-go: полный текст ревью, id сессии для лога и
 // ссылки на прогон, служебные поля вызова claude (для лога и сохранения
 // в БД, см. store.ClaudeInvocation) и разобранный вердикт.
 type Result struct {
@@ -105,7 +105,7 @@ type Result struct {
 	FinishedAt time.Time
 }
 
-// SpecResult — итог запуска /spec: содержимое собранного ТЗ (Content —
+// SpecResult — итог запуска /spec-go: содержимое собранного ТЗ (Content —
 // то, что раньше писалось в файл самой командой claude; теперь claude
 // только выводит текст в ответ, а сохраняет его вызывающая сторона —
 // см. Требование «ТЗ хранится в БД, не в файле») плюс те же служебные поля,
@@ -137,7 +137,7 @@ type CallOptions struct {
 }
 
 // TokenUsage — токены и стоимость одного вызова `claude -p`. Складывается
-// вызывающей стороной для /spec и /review, чтобы получить суммарный расход
+// вызывающей стороной для /spec-go и /review-go, чтобы получить суммарный расход
 // на одну задачу (см. Store.MarkDone/MarkFailed).
 type TokenUsage struct {
 	InputTokens  int
@@ -187,7 +187,7 @@ func (r claudeJSONResult) tokenUsage() TokenUsage {
 // корень с несколькими независимыми репозиториями как подпапками (типовая
 // раскладка монорепо-из-репо) — в этом случае обновляются все найденные.
 // Go по-прежнему не решает, какой из репозиториев относится к задаче, это
-// делает /review через свой доступ к Bash; здесь только "обнови всё, что
+// делает /review-go через свой доступ к Bash; здесь только "обнови всё, что
 // нашлось", без анализа конкретной задачи.
 func (r *Runner) GitFetch(ctx context.Context) error {
 	repos, err := discoverGitRepos(r.RepoPath)
@@ -250,26 +250,28 @@ func isGitRepo(dir string) bool {
 }
 
 // SpecFilePath возвращает путь, по которому вызывающая сторона обязана
-// сохранить ТЗ задачи, собранное /spec (см. Требование: ТЗ хранится в БД —
+// сохранить ТЗ задачи, собранное /spec-go (см. Требование: ТЗ хранится в БД —
 // БД является источником истины, этот файл — производный от неё артефакт,
-// нужный только затем, что /review читает ТЗ из файла тулом Read).
+// нужный только затем, что /review-go читает ТЗ из файла тулом Read).
 //
 // Каталог специально НЕ внутри .claude/: Claude Code относит всё под
 // .claude/ к чувствительным путям и блокирует запись в них тулом Write
 // независимо от --allowedTools (проверено эмпирически). Здесь это уже не
-// имеет значения для самого /spec (он больше не пишет файл — это делает Go
-// через os.WriteFile), но /review по-прежнему ищет готовый документ по
+// имеет значения для самого /spec-go (он больше не пишет файл — это делает
+// Go через os.WriteFile), но /review-go по-прежнему ищет готовый документ по
 // этому пути, поэтому каталог остаётся прежним.
 func (r *Runner) SpecFilePath(taskID string) string {
 	return filepath.Join(r.RepoPath, "specs", taskID+".md")
 }
 
-// RunSpec запускает "/spec\n<url задачи>" отдельной сессией claude и
-// возвращает собранное ТЗ как обычный текст ответа — команда больше не
-// сохраняет файл сама (см. .claude/commands/spec.md, раздел 6): сохранение
-// в БД и на диск делает вызывающая сторона (см. queue.stageSpec).
+// RunSpec запускает "/spec-go\n<url задачи>" отдельной сессией claude и
+// возвращает собранное ТЗ как обычный текст ответа — команда не сохраняет
+// файл сама (см. .claude/commands/spec-go.md, раздел 6): сохранение в БД
+// и на диск делает вызывающая сторона (см. queue.stageSpec). /spec-go —
+// версия команды для этого пайплайна; для ручного запуска в интерактивной
+// сессии есть отдельная /spec, которая сохраняет файл сама.
 func (r *Runner) RunSpec(ctx context.Context, taskURL string, opts CallOptions) (SpecResult, error) {
-	prompt := "/spec\n" + taskURL
+	prompt := "/spec-go\n" + taskURL
 	started := time.Now()
 	result, model, effort, stderr, err := r.run(ctx, prompt, opts)
 	sr := SpecResult{
@@ -278,16 +280,18 @@ func (r *Runner) RunSpec(ctx context.Context, taskURL string, opts CallOptions) 
 		Prompt: prompt, Model: model, Effort: effort, StartedAt: started, FinishedAt: time.Now(),
 	}
 	if err != nil {
-		return sr, fmt.Errorf("/spec run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
+		return sr, fmt.Errorf("/spec-go run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
 	}
 	return sr, nil
 }
 
-// RunReview запускает "/review\n<url задачи>[\n<путь к спеке>]" отдельной
+// RunReview запускает "/review-go\n<url задачи>[\n<путь к спеке>]" отдельной
 // сессией claude и возвращает полный вывод, id сессии и разобранный вердикт.
-// specPath пустой означает, что готового ТЗ нет: /review соберёт его сама.
+// specPath пустой означает, что готового ТЗ нет: /review-go соберёт его сама.
+// /review-go — версия команды для этого пайплайна (только замечания в ответе,
+// без ручной интерактивности); для ручного запуска есть отдельная /review.
 func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string, opts CallOptions) (Result, error) {
-	prompt := "/review\n" + taskURL
+	prompt := "/review-go\n" + taskURL
 	if specPath != "" {
 		prompt += "\n" + specPath
 	}
@@ -301,7 +305,7 @@ func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string, opts C
 	}
 	if err != nil {
 		res.Verdict = Verdict{Status: StatusBlocked}
-		return res, fmt.Errorf("/review run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
+		return res, fmt.Errorf("/review-go run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
 	}
 
 	res.Output = result.Result
@@ -357,12 +361,13 @@ func (r *Runner) run(ctx context.Context, prompt string, opts CallOptions) (resu
 		}
 	}
 
-	// Список — объединение allowed-tools обеих команд (.claude/commands/spec.md
-	// и review.md): обеим нужен Bash(notion-cli:*) для сбора ТЗ из Notion.
-	// Write здесь больше не нужен — ни /spec, ни /review не пишут файлы сами
-	// (см. SpecFilePath и .claude/commands/spec.md, раздел 6): наименьший
-	// достаточный набор прав для пайплайна, обрабатывающего непроверенное
-	// содержимое задач ClickUp.
+	// Список — объединение allowed-tools обеих команд пайплайна
+	// (.claude/commands/spec-go.md и review-go.md): обеим нужен
+	// Bash(notion-cli:*) для сбора ТЗ из Notion. Write здесь не нужен —
+	// ни /spec-go, ни /review-go не пишут файлы сами (см. SpecFilePath
+	// и .claude/commands/spec-go.md, раздел 6): наименьший достаточный
+	// набор прав для пайплайна, обрабатывающего непроверенное содержимое
+	// задач ClickUp.
 	args := []string{"-p", prompt,
 		"--output-format", "stream-json", "--verbose",
 		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Bash(notion-cli:*)", "Read", "Grep", "Glob"}

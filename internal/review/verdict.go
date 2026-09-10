@@ -1,4 +1,4 @@
-// Package review запускает /spec и /review силами claude -p и разбирает
+// Package review запускает /spec-go и /review-go силами claude -p и разбирает
 // контракт вердикта. Смысл ревью не анализируется здесь: Go только парсит
 // одну служебную строку вида "ИТОГ: критичных=N важных=N минор=N статус=X".
 package review
@@ -12,7 +12,7 @@ const (
 	StatusBlocked = "blocked"
 )
 
-// Verdict — разобранный контракт вердикта команды /review.
+// Verdict — разобранный контракт вердикта команды /review-go.
 type Verdict struct {
 	Critical  int
 	Important int

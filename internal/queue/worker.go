@@ -24,9 +24,11 @@ import (
 // для того, чтобы один ответ ревью на большой PR не забивал журнал сервиса.
 const maxLoggedOutput = 8000
 
-// requiredCommands — slash-команды, без которых /spec и /review не смогут
-// отработать содержательно; проверяются перед запуском claude.
-var requiredCommands = []string{"spec.md", "review.md"}
+// requiredCommands — slash-команды, без которых /spec-go и /review-go не
+// смогут отработать содержательно; проверяются перед запуском claude. Это
+// версии команд для этого пайплайна — не путать с ручными /spec и /review
+// (те сохраняют файл и рассчитаны на интерактивную сессию человека).
+var requiredCommands = []string{"spec-go.md", "review-go.md"}
 
 // ClickUp — часть API ClickUp, нужная воркеру очереди. Позволяет подменять
 // реальный клиент фейком в тестах.
@@ -44,8 +46,8 @@ type Runner interface {
 	GitFetch(ctx context.Context) error
 	RunSpec(ctx context.Context, taskURL string, opts review.CallOptions) (review.SpecResult, error)
 	RunReview(ctx context.Context, taskURL, specPath string, opts review.CallOptions) (review.Result, error)
-	// SpecFilePath — путь, по которому нужно сохранить (не сама /spec —
-	// см. Queue.runReview) содержимое собранного ТЗ, чтобы /review могла
+	// SpecFilePath — путь, по которому нужно сохранить (не сама /spec-go —
+	// см. Queue.runReview) содержимое собранного ТЗ, чтобы /review-go могла
 	// прочитать его тулом Read. Источник истины для этого содержимого —
 	// БД (specStageData.Content), файл — лишь производный от неё артефакт.
 	SpecFilePath(taskID string) string
@@ -101,7 +103,7 @@ func belongsToConfiguredList(task *clickup.Task, cfg *config.Config) bool {
 // specFileID возвращает ID задачи, под которым сохраняется файл ТЗ
 // (`specs/<ID>.md`, см. Runner.SpecFilePath): человекочитаемый custom_id
 // (например, "PNL-4528"), если он у задачи задан, иначе нативный ID ClickUp.
-// В отличие от прежней версии (когда /spec сама писала файл и приходилось
+// В отличие от прежней версии (когда /spec-go сама писала файл и приходилось
 // угадывать, каким именем она его назвала) Go теперь пишет этот файл сам
 // из содержимого, сохранённого в БД, — поэтому имя выбирается детерминированно,
 // без перебора кандидатов.
@@ -112,8 +114,8 @@ func specFileID(task *clickup.Task) string {
 	return task.ID
 }
 
-// missingCommands проверяет наличие .claude/commands/{spec,review}.md в
-// рабочей копии репозитория — без них claude не сможет содержательно
+// missingCommands проверяет наличие .claude/commands/{spec-go,review-go}.md
+// в рабочей копии репозитория — без них claude не сможет содержательно
 // отработать, и запускать процесс нет смысла.
 func missingCommands(repoPath string) []string {
 	var missing []string
@@ -127,7 +129,7 @@ func missingCommands(repoPath string) []string {
 }
 
 // processTask прогоняет одну задачу через полный цикл: проверка условия,
-// дедупликация, перевод в running, /spec+/review, переходы статуса и
+// дедупликация, перевод в running, /spec-go+/review-go, переходы статуса и
 // исполнителя, комментарий, уведомление в Slack и в лог. opts — переопределение
 // модели/effort claude на этот конкретный прогон (см. RunOptions), обычно
 // нулевое (использовать текущее значение по умолчанию).
@@ -228,8 +230,8 @@ func (q *Queue) resumeTask(taskID string) {
 // Каждый этап логируется в run_stages (Store.StartStage/FinishStage/
 // FailStage) — если runID уже переоткрыт после паузы/обрыва процесса (см.
 // Store.ReopenOrEnqueue), уже пройденные этапы берутся из БД, а не
-// выполняются заново: /spec и /review — самые дорогие вызовы во всём цикле,
-// и именно их результат («результат /spec сохранялся в табличку») не нужно
+// выполняются заново: /spec-go и /review-go — самые дорогие вызовы во всём цикле,
+// и именно их результат («результат /spec-go сохранялся в табличку») не нужно
 // терять при возобновлении.
 func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64, opts RunOptions) {
 	cfg := q.deps.Cfg
@@ -313,7 +315,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		if content != "" {
 			specID = specFileID(task)
 		} else {
-			log.Warn("/spec did not return any ТЗ content, running /review with the task link only")
+			log.Warn("/spec-go did not return any ТЗ content, running /review-go with the task link only")
 		}
 		return specStageData{SessionID: sr.SessionID, SpecID: specID, Content: content, Usage: sr.Usage}, nil
 	})
@@ -322,13 +324,13 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		return
 	}
 	if specErr != nil {
-		log.Warn("/spec run failed, falling back to a single task link for /review",
+		log.Warn("/spec-go run failed, falling back to a single task link for /review-go",
 			"error", specErr.Error(), "spec_session_id", spec.SessionID)
 	}
 
 	// ТЗ хранится в БД (specStageData.Content), а не в файле — файл здесь
-	// лишь производный артефакт, который читает /review тулом Read.
-	// Перезаписывается из БД перед КАЖДЫМ запуском /review, в том числе при
+	// лишь производный артефакт, который читает /review-go тулом Read.
+	// Перезаписывается из БД перед КАЖДЫМ запуском /review-go, в том числе при
 	// возобновлении прогона (см. Store.ReopenOrEnqueue): рабочая копия
 	// репозитория в новом контейнере может не содержать файла, который был
 	// записан предыдущим (см. ensureSpecFile).
@@ -363,7 +365,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	// для взятого из run_stages при возобновлении.
 	verdict := review.ParseVerdict(reviewData.Output)
 	if reviewErr != nil {
-		log.Error("/review run failed", "error", reviewErr.Error(), "stderr", truncateForLog(reviewData.Stderr))
+		log.Error("/review-go run failed", "error", reviewErr.Error(), "stderr", truncateForLog(reviewData.Stderr))
 	} else if verdict.Raw == "" {
 		log.Warn("review output had no parsable ИТОГ line, treating as blocked")
 	}
@@ -384,7 +386,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	// Задачу нельзя трогать так, будто её реально проверили: статус, тег и
 	// исполнитель остаются как есть — карточка так и останется в running-
 	// колонке до ручного возврата или повторного запуска, но не получит
-	// ложный вердикт. Только настоящий ответ /review (даже blocked) меняет
+	// ложный вердикт. Только настоящий ответ /review-go (даже blocked) меняет
 	// статус/тег/исполнителя.
 	var targetStatus string
 	var assigneeIDs []int
@@ -550,10 +552,10 @@ func storeUsage(u review.TokenUsage) store.Usage {
 
 // ensureSpecFile перезаписывает файл ТЗ на диске из содержимого, сохранённого
 // в БД (specStageData.Content), и возвращает относительный путь для передачи
-// /review, либо "" если содержимого нет. БД — источник истины (Требование:
+// /review-go, либо "" если содержимого нет. БД — источник истины (Требование:
 // «ТЗ сохранялось в базу и использовалось из базы»); файл — восстанавливаемый
-// из неё артефакт, нужный только затем, что /review читает его тулом Read.
-// Вызывается перед каждым запуском /review, в том числе при возобновлении —
+// из неё артефакт, нужный только затем, что /review-go читает его тулом Read.
+// Вызывается перед каждым запуском /review-go, в том числе при возобновлении —
 // рабочая копия репозитория в новом контейнере могла не унаследовать файл,
 // записанный предыдущим экземпляром сервиса.
 func (q *Queue) ensureSpecFile(log *slog.Logger, spec specStageData) string {
@@ -563,18 +565,18 @@ func (q *Queue) ensureSpecFile(log *slog.Logger, spec specStageData) string {
 
 	absPath := q.deps.Runner.SpecFilePath(spec.SpecID)
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-		log.Error("failed to create specs directory, running /review with the task link only", "error", err.Error())
+		log.Error("failed to create specs directory, running /review-go with the task link only", "error", err.Error())
 		return ""
 	}
 	if err := os.WriteFile(absPath, []byte(spec.Content), 0o644); err != nil {
-		log.Error("failed to write spec file from stored content, running /review with the task link only", "error", err.Error())
+		log.Error("failed to write spec file from stored content, running /review-go with the task link only", "error", err.Error())
 		return ""
 	}
 	return filepath.Join("specs", spec.SpecID+".md")
 }
 
-// invocationLog — общий вид одного вызова claude (что для /spec, что для
-// /review), нужный только для логирования и сохранения в БД (см.
+// invocationLog — общий вид одного вызова claude (что для /spec-go, что для
+// /review-go), нужный только для логирования и сохранения в БД (см.
 // Queue.logAndRecordInvocation) — отдельно от review.Result/SpecResult,
 // чтобы не завязывать это на конкретный из двух типов.
 type invocationLog struct {

@@ -16,10 +16,10 @@ import (
 // этапы не выполняются заново, а берутся из БД.
 const (
 	stageSetup         = "setup"          // перевод в running-статус, снятие исполнителей, уведомление о начале
-	stageCommandsCheck = "commands_check" // наличие .claude/commands/{spec,review}.md
+	stageCommandsCheck = "commands_check" // наличие .claude/commands/{spec-go,review-go}.md
 	stageGitFetch      = "git_fetch"      // обновление рабочей копии репозитория(-ев)
-	stageSpec          = "spec"           // /spec — сбор уточнённого ТЗ
-	stageReview        = "review"         // /review — само ревью
+	stageSpec          = "spec"           // /spec-go — сбор уточнённого ТЗ
+	stageReview        = "review"         // /review-go — само ревью
 	stageDecide        = "decide"         // перевод в колонку по вердикту, назначение исполнителя, снятие тега
 	stageComment       = "comment"        // публикация текста ревью комментарием в задаче
 )
@@ -33,16 +33,16 @@ type setupData struct {
 	OriginalAssignees []int `json:"original_assignees"`
 }
 
-// specStageData — результат /spec, сохранённый в run_stages: id сессии
+// specStageData — результат /spec-go, сохранённый в run_stages: id сессии
 // claude, содержимое собранного ТЗ и id, под которым оно будет сохранено на
-// диск для /review (SpecID — CustomID задачи или, если его нет, нативный
-// ID; см. specFileID). Content пуст, если /spec не смогла собрать ТЗ.
+// диск для /review-go (SpecID — CustomID задачи или, если его нет, нативный
+// ID; см. specFileID). Content пуст, если /spec-go не смогла собрать ТЗ.
 //
 // Само ТЗ хранится здесь, в БД, а не в файле (Требование: «ТЗ сохранялось
 // не в файл, а в базу данных ... и использовалось из базы для проверки
-// задач») — файл под SpecFilePath(SpecID), который читает /review,
+// задач») — файл под SpecFilePath(SpecID), который читает /review-go,
 // является производным и перезаписывается из этого поля перед каждым
-// запуском /review (см. ensureSpecFile), в том числе при возобновлении
+// запуском /review-go (см. ensureSpecFile), в том числе при возобновлении
 // прогона в свежем контейнере, где рабочая копия могла быть создана заново.
 type specStageData struct {
 	SessionID string            `json:"session_id"`
@@ -51,7 +51,7 @@ type specStageData struct {
 	Usage     review.TokenUsage `json:"usage"`
 }
 
-// reviewStageData — результат /review. Вердикт отдельно не хранится —
+// reviewStageData — результат /review-go. Вердикт отдельно не хранится —
 // восстанавливается из Output через review.ParseVerdict (чистая функция,
 // без внешних вызовов), одинаково что для свежего прогона, что для
 // восстановленного из БД.
