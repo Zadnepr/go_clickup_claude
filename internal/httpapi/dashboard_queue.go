@@ -1,13 +1,62 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/Zadnepr/go_clickup_claude/internal/clickup"
 	"github.com/Zadnepr/go_clickup_claude/internal/config"
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
+
+// taskDetailsCacheTTL — сколько держать в кеше результат GetTask для одной
+// задачи между опросами GET /api/queue. Дашборд опрашивает этот эндпоинт
+// каждые 5 секунд (см. static/dashboard.html: refreshFast); без кеша
+// каждый опрос добавляет по одному вызову ClickUp API на КАЖДУЮ задачу в
+// «Очереди» и «Текущей задаче» — при глубокой очереди и нескольких
+// открытых вкладках дашборда это быстро упирается в rate limit ClickUp API
+// (наблюдалось на практике: каскад "clickup api rate limited", из-за
+// которого проваливались параллельные операции — уведомление в Slack,
+// сверка). Карточка задачи не обязана быть live-актуальной на дашборде
+// ежесекундно — устаревание на несколько секунд незаметно и безопасно.
+const taskDetailsCacheTTL = 20 * time.Second
+
+// taskDetailsCache — общий на все запросы к одному инстансу mux (создаётся
+// один раз в newQueueHandler, а не в каждом запросе) TTL-кеш GetTask.
+type taskDetailsCache struct {
+	mu   sync.Mutex
+	byID map[string]cachedTask
+}
+
+type cachedTask struct {
+	task *clickup.Task
+	err  error
+	at   time.Time
+}
+
+func newTaskDetailsCache() *taskDetailsCache {
+	return &taskDetailsCache{byID: make(map[string]cachedTask)}
+}
+
+func (c *taskDetailsCache) Get(ctx context.Context, cu ClickUpReader, taskID string) (*clickup.Task, error) {
+	c.mu.Lock()
+	if e, ok := c.byID[taskID]; ok && time.Since(e.at) < taskDetailsCacheTTL {
+		c.mu.Unlock()
+		return e.task, e.err
+	}
+	c.mu.Unlock()
+
+	task, err := cu.GetTask(ctx, taskID)
+
+	c.mu.Lock()
+	c.byID[taskID] = cachedTask{task: task, err: err, at: time.Now()}
+	c.mu.Unlock()
+
+	return task, err
+}
 
 // activeRunView — одна "текущая задача" в ответе GET /api/queue: то, что
 // обрабатывается прямо сейчас (обычно одна, если WORKER_CONCURRENCY=1),
@@ -47,6 +96,8 @@ type otherTaskView struct {
 // остальные задачи в колонке-триггере, у которых просто нет тега-триггера
 // (сверка их не подхватит сама, см. Требование «список задач без тега»).
 func newQueueHandler(deps Deps) http.HandlerFunc {
+	taskCache := newTaskDetailsCache()
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		active := make([]activeRunView, 0, len(deps.Queue.ActiveRuns()))
@@ -68,7 +119,7 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 			}
 
 			if deps.ClickUp != nil {
-				if task, err := deps.ClickUp.GetTask(ctx, ar.TaskID); err == nil {
+				if task, err := taskCache.Get(ctx, deps.ClickUp, ar.TaskID); err == nil {
 					view.TaskName = task.Name
 					view.TaskURL = task.URL
 				}
@@ -95,7 +146,7 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 		if deps.ClickUp != nil {
 			for _, taskID := range deps.Queue.Pending() {
 				view := otherTaskView{TaskID: taskID, URL: "https://app.clickup.com/t/" + taskID}
-				if task, err := deps.ClickUp.GetTask(ctx, taskID); err == nil {
+				if task, err := taskCache.Get(ctx, deps.ClickUp, taskID); err == nil {
 					view.CustomID = task.CustomID
 					view.Name = task.Name
 					view.URL = task.URL
