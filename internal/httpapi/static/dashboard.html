@@ -436,6 +436,18 @@ function avatarsHTML(assignees) {
 
 async function loadSettings() {
   const body = $("#settings-body");
+  // Как и в очереди (см. refreshListSection) — периодическое обновление не
+  // должно затирать то, что пользователь уже выбрал в селектах, но ещё не
+  // сохранил: пока фокус стоит на одном из них, весь блок настроек в этом
+  // тике не перерисовывается вовсе.
+  if (document.activeElement && document.activeElement.tagName === "SELECT" && body.contains(document.activeElement)) {
+    return;
+  }
+  const prevModel = $("#model-select");
+  const prevEffort = $("#effort-select");
+  const savedSelection = (prevModel || prevEffort)
+    ? { model: prevModel ? prevModel.value : "", effort: prevEffort ? prevEffort.value : "" }
+    : null;
   try {
     const c = await api("/api/config");
     body.innerHTML = `
@@ -465,6 +477,11 @@ async function loadSettings() {
         <button class="btn primary" id="model-save-btn">💾 Сохранить модель/effort</button>
         <span id="model-save-status" class="empty" style="padding:0"></span>
       </div>`;
+
+    if (savedSelection) {
+      if (savedSelection.model) $("#model-select").value = savedSelection.model;
+      if (savedSelection.effort) $("#effort-select").value = savedSelection.effort;
+    }
 
     $("#model-save-btn").addEventListener("click", async () => {
       const btn = $("#model-save-btn");
@@ -547,6 +564,47 @@ async function runTask(taskId, row, btn) {
   }
 }
 
+// ---------- сохранение выбора в селектах между обновлениями ----------
+// Автообновление (см. refreshFast/refreshAll) периодически перерисовывает
+// списки заново — без этого пользователь, начавший выбирать модель/effort
+// в select ровно в момент обновления, терял бы свой выбор (см. отзыв:
+// "при автообновлении select сбрасывается"). Поэтому: (1) пока фокус внутри
+// контейнера стоит на select — секцию вообще не перерисовываем в этом
+// тике; (2) иначе перед перерисовкой запоминаем уже выбранные в строках
+// значения по task_id и восстанавливаем их после.
+function captureRowSelections(container) {
+  const map = {};
+  $$(".queue-item", container).forEach(row => {
+    const id = row.dataset.task;
+    const model = $(".model-select", row);
+    const effort = $(".effort-select", row);
+    map[id] = { model: model ? model.value : "", effort: effort ? effort.value : "" };
+  });
+  return map;
+}
+function restoreRowSelections(container, saved) {
+  $$(".queue-item", container).forEach(row => {
+    const prev = saved[row.dataset.task];
+    if (!prev) return;
+    const model = $(".model-select", row);
+    const effort = $(".effort-select", row);
+    if (model && prev.model) model.value = prev.model;
+    if (effort && prev.effort) effort.value = prev.effort;
+  });
+}
+function refreshListSection(container, render) {
+  if (document.activeElement && document.activeElement.tagName === "SELECT" && container.contains(document.activeElement)) {
+    return; // пользователь прямо сейчас выбирает значение — не трогаем
+  }
+  const saved = captureRowSelections(container);
+  render();
+  restoreRowSelections(container, saved);
+}
+
+function clickupURL(taskId) {
+  return `https://app.clickup.com/t/${encodeURIComponent(taskId)}`;
+}
+
 async function loadQueue() {
   const curCount = $("#current-count");
   const curBody = $("#current-body");
@@ -596,12 +654,14 @@ async function loadQueue() {
     }
 
     qCount.textContent = pending.length ? `(${pending.length})` : "";
-    if (!pending.length) {
-      qBody.innerHTML = '<div class="empty">Очередь пуста</div>';
-    } else {
+    refreshListSection(qBody, () => {
+      if (!pending.length) {
+        qBody.innerHTML = '<div class="empty">Очередь пуста</div>';
+        return;
+      }
       qBody.innerHTML = '<div class="queue-list">' + pending.map(id => `
         <div class="queue-item" data-task="${esc(id)}">
-          <span class="id">${esc(id)}</span>
+          <a class="id" href="${esc(clickupURL(id))}" target="_blank" rel="noopener">${esc(id)}</a>
           ${runControlsHTML()}
           <button class="btn primary" data-act="run">▶️ Запустить сейчас</button>
         </div>`).join("") + "</div>";
@@ -609,15 +669,17 @@ async function loadQueue() {
         const taskId = row.dataset.task;
         $(".btn", row).addEventListener("click", (ev) => runTask(taskId, row, ev.currentTarget));
       });
-    }
+    });
 
     $("#other-tag-label").textContent = otherToCheck.length ? `(${otherToCheck.length})` : "";
-    if (!otherToCheck.length) {
-      otherBody.innerHTML = '<div class="empty">Таких задач нет</div>';
-    } else {
+    refreshListSection(otherBody, () => {
+      if (!otherToCheck.length) {
+        otherBody.innerHTML = '<div class="empty">Таких задач нет</div>';
+        return;
+      }
       otherBody.innerHTML = '<div class="queue-list">' + otherToCheck.map(t => `
         <div class="queue-item" data-task="${esc(t.task_id)}">
-          <span class="id">${esc(t.custom_id || t.task_id)}</span>
+          <a class="id" href="${esc(t.url || clickupURL(t.task_id))}" target="_blank" rel="noopener">${esc(t.custom_id || t.task_id)}</a>
           ${avatarsHTML(t.assignees)}
           <span class="name">${esc(t.name)}</span>
           ${runControlsHTML()}
@@ -627,7 +689,7 @@ async function loadQueue() {
         const taskId = row.dataset.task;
         $(".btn", row).addEventListener("click", (ev) => runTask(taskId, row, ev.currentTarget));
       });
-    }
+    });
   } catch (e) {
     curBody.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.message)}</div>`;
     qBody.innerHTML = "";
