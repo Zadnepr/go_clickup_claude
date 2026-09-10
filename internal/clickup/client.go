@@ -444,8 +444,25 @@ func (c *Client) AddComment(ctx context.Context, taskID, text string) error {
 // ListTasksByTagAndStatus возвращает задачи списка с заданным тегом и статусом
 // (используется сверкой, см. Требование 1.2).
 func (c *Client) ListTasksByTagAndStatus(ctx context.Context, listID, tag, status string) ([]Task, error) {
+	return c.listTasks(ctx, listID, tag, status)
+}
+
+// ListTasksByStatus возвращает задачи списка с заданным статусом, независимо
+// от тега, — используется веб-интерфейсом, чтобы показать под текущей
+// очередью остальные задачи в колонке-триггере, которые ещё не помечены
+// тегом-триггером (см. Требование «список задач без тега для ручного
+// запуска»).
+func (c *Client) ListTasksByStatus(ctx context.Context, listID, status string) ([]Task, error) {
+	return c.listTasks(ctx, listID, "", status)
+}
+
+// listTasks — общая реализация ListTasksByTagAndStatus/ListTasksByStatus:
+// tag="" означает не фильтровать по тегу вовсе.
+func (c *Client) listTasks(ctx context.Context, listID, tag, status string) ([]Task, error) {
 	q := url.Values{}
-	q.Add("tags[]", tag)
+	if tag != "" {
+		q.Add("tags[]", tag)
+	}
 	q.Add("statuses[]", status)
 	q.Add("include_closed", "true")
 

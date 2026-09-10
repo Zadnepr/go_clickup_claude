@@ -5,11 +5,23 @@ import (
 	"time"
 )
 
-// queueItem — один элемент буферизованного канала: task_id и признак,
-// что это восстановленный после рестарта прогон (см. SubmitResume).
+// RunOptions — переопределения для одного конкретного прогона поверх
+// текущих значений по умолчанию (см. review.Runner.SetModelEffort) —
+// например, ручной запуск конкретной задачи с другой моделью/effort через
+// веб-интерфейс (см. Требование «выбрать модель для текущей задачи»).
+// Пустая строка — не переопределять, использовать значение по умолчанию.
+type RunOptions struct {
+	Model  string
+	Effort string
+}
+
+// queueItem — один элемент буферизованного канала: task_id, признак, что
+// это восстановленный после рестарта прогон (см. SubmitResume), и
+// переопределения модели/effort на этот конкретный запуск (см. RunOptions).
 type queueItem struct {
 	taskID string
 	resume bool
+	opts   RunOptions
 }
 
 // Queue — буферизованный канал task_id плюс пул воркеров (WORKER_CONCURRENCY).
@@ -54,8 +66,15 @@ func New(deps Deps, bufferSize int) *Queue {
 // сверке. Вызывается и вебхуком, и тикером сверки, и ручным /api/run — все
 // три источника ведут в одну функцию постановки в очередь.
 func (q *Queue) Submit(taskID string) bool {
+	return q.SubmitWithOptions(taskID, RunOptions{})
+}
+
+// SubmitWithOptions — как Submit, но с переопределением модели/effort для
+// этого конкретного запуска (см. RunOptions) — используется ручным запуском
+// из веб-интерфейса, когда для задачи явно выбрана другая модель/effort.
+func (q *Queue) SubmitWithOptions(taskID string, opts RunOptions) bool {
 	select {
-	case q.ch <- queueItem{taskID: taskID}:
+	case q.ch <- queueItem{taskID: taskID, opts: opts}:
 		q.addPending(taskID)
 		return true
 	default:
@@ -122,7 +141,7 @@ func (q *Queue) Start(workers int) {
 				if item.resume {
 					q.resumeTask(item.taskID)
 				} else {
-					q.processTask(item.taskID)
+					q.processTask(item.taskID, item.opts)
 				}
 			}
 		}()

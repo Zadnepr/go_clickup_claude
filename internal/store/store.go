@@ -197,6 +197,16 @@ CREATE TABLE IF NOT EXISTS claude_invocations (
 	finished_at   DATETIME NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_claude_invocations_run_id ON claude_invocations(run_id);
+
+-- settings — простое хранилище "ключ-значение" для настроек, которые можно
+-- менять на лету через веб-интерфейс (сейчас — модель/effort claude, см.
+-- GetSetting/SetSetting), без перезапуска сервиса и без потери значения
+-- при перезапуске (в отличие от .env, который читается только один раз
+-- при старте).
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
 
 // migrateTokenColumns докатывает колонки учёта токенов на базу, созданную
@@ -610,6 +620,34 @@ func (s *Store) UpdateRunningUsage(ctx context.Context, runID int64, usage Usage
 	`, usage.InputTokens, usage.OutputTokens, usage.CostUSD, runID)
 	if err != nil {
 		return fmt.Errorf("update running usage for run %d: %w", runID, err)
+	}
+	return nil
+}
+
+// GetSetting возвращает значение настройки key. ok=false и без ошибки
+// означает, что настройка не задана — вызывающая сторона должна тогда
+// использовать значение по умолчанию (обычно из .env/Config).
+func (s *Store) GetSetting(ctx context.Context, key string) (value string, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get setting %s: %w", key, err)
+	}
+	return value, true, nil
+}
+
+// SetSetting сохраняет значение настройки key, перезаписывая существующее.
+// Используется веб-интерфейсом, чтобы менять модель/effort claude на лету,
+// без перезапуска сервиса и без потери значения при перезапуске.
+func (s *Store) SetSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	if err != nil {
+		return fmt.Errorf("set setting %s: %w", key, err)
 	}
 	return nil
 }

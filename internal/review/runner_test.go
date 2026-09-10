@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +41,35 @@ exit %d
 	return path
 }
 
+// writeFakeClaudeCapturingArgs — как writeFakeClaude, но дополнительно
+// сохраняет полученные аргументы в argsPath (по одному на строку) — чтобы
+// проверить, какие --model/--effort реально передаются (см.
+// CallOptions.Model/Effort и Runner.SetModelEffort).
+func writeFakeClaudeCapturingArgs(t *testing.T, jsonOut string, argsPath string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude script requires a POSIX shell")
+	}
+
+	dir := t.TempDir()
+	dataPath := filepath.Join(dir, "output.json")
+	if err := os.WriteFile(dataPath, []byte(jsonOut), 0o644); err != nil {
+		t.Fatalf("write fake claude output: %v", err)
+	}
+
+	path := filepath.Join(dir, "fake-claude.sh")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$@" > %q
+cat %q
+exit 0
+`, argsPath, dataPath)
+
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake claude script: %v", err)
+	}
+	return path
+}
+
 func TestRunner_RunReview_ParsesOutputAndSession(t *testing.T) {
 	out := claudeJSONResult{
 		Type:         "result",
@@ -55,7 +85,7 @@ func TestRunner_RunReview_ParsesOutputAndSession(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
+	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", CallOptions{})
 	if err != nil {
 		t.Fatalf("RunReview error: %v", err)
 	}
@@ -83,7 +113,7 @@ func TestRunner_RunSpec_ReturnsUsage(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	sr, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", nil)
+	sr, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", CallOptions{})
 	if err != nil {
 		t.Fatalf("RunSpec error: %v", err)
 	}
@@ -120,7 +150,7 @@ func TestRunner_RunReview_ClaudeReportsError(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", CallOptions{})
 	if err == nil {
 		t.Fatal("expected error when claude reports is_error=true")
 	}
@@ -139,7 +169,7 @@ func TestRunner_RunReview_UsageLimitReached(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", CallOptions{})
 	if err == nil {
 		t.Fatal("expected error when usage limit is reached")
 	}
@@ -160,7 +190,7 @@ func TestRunner_RunSpec_UsageLimitReached(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	_, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", nil)
+	_, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", CallOptions{})
 	if !errors.Is(err, ErrUsageLimit) {
 		t.Errorf("expected errors.Is(err, ErrUsageLimit), got: %v", err)
 	}
@@ -170,7 +200,7 @@ func TestRunner_RunReview_UnparsableOutput(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, "not json at all", 0)}
 
-	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", nil)
+	_, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", CallOptions{})
 	if err == nil {
 		t.Fatal("expected error for unparsable claude output")
 	}
@@ -183,7 +213,7 @@ func TestRunner_RunReview_WithSpecPath(t *testing.T) {
 	repo := t.TempDir()
 	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
 
-	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", r.SpecFilePath("123"), nil)
+	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", r.SpecFilePath("123"), CallOptions{})
 	if err != nil {
 		t.Fatalf("RunReview error: %v", err)
 	}
@@ -289,5 +319,89 @@ func TestRunner_SpecFilePath(t *testing.T) {
 	want := filepath.Join("/repo", "specs", "42.md")
 	if got != want {
 		t.Errorf("SpecFilePath = %q, want %q", got, want)
+	}
+}
+
+func TestNewRunner_SetsModelEffort(t *testing.T) {
+	r := NewRunner("/repo", "/home", "haiku", "low")
+	model, effort := r.ModelEffort()
+	if model != "haiku" || effort != "low" {
+		t.Errorf("ModelEffort() = (%q, %q), want (haiku, low)", model, effort)
+	}
+}
+
+func TestSetModelEffort_ChangesDefaultForSubsequentCalls(t *testing.T) {
+	out := claudeJSONResult{Type: "result", Result: "ok", SessionID: "s1"}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaudeCapturingArgs(t, string(b), argsPath)}
+	r.SetModelEffort("sonnet", "high")
+
+	if _, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", CallOptions{}); err != nil {
+		t.Fatalf("RunSpec error: %v", err)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read captured args: %v", err)
+	}
+	argsStr := string(args)
+	if !strings.Contains(argsStr, "sonnet") || !strings.Contains(argsStr, "high") {
+		t.Errorf("expected sonnet/high in claude args, got: %s", argsStr)
+	}
+}
+
+func TestCallOptions_OverridesDefaultModelAndEffort(t *testing.T) {
+	out := claudeJSONResult{Type: "result", Result: "ok", SessionID: "s1"}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "args.txt")
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaudeCapturingArgs(t, string(b), argsPath)}
+	r.SetModelEffort("sonnet", "high")
+
+	sr, err := r.RunSpec(context.Background(), "https://app.clickup.com/t/123", CallOptions{Model: "haiku", Effort: "low"})
+	if err != nil {
+		t.Fatalf("RunSpec error: %v", err)
+	}
+	if sr.Model != "haiku" || sr.Effort != "low" {
+		t.Errorf("SpecResult.Model/Effort = %q/%q, want haiku/low", sr.Model, sr.Effort)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read captured args: %v", err)
+	}
+	argsStr := string(args)
+	if !strings.Contains(argsStr, "haiku") || !strings.Contains(argsStr, "low") {
+		t.Errorf("expected the per-call override (haiku/low) in claude args, got: %s", argsStr)
+	}
+	if strings.Contains(argsStr, "sonnet") {
+		t.Errorf("expected the runner default (sonnet) NOT to be used when overridden, got: %s", argsStr)
+	}
+
+	// Дефолт для последующих (не переопределённых) вызовов не должен был
+	// поменяться — переопределение действует только на этот вызов.
+	if model, effort := r.ModelEffort(); model != "sonnet" || effort != "high" {
+		t.Errorf("expected runner default to remain sonnet/high, got %q/%q", model, effort)
+	}
+}
+
+func TestRunReview_ReportsActualModelEffortUsed(t *testing.T) {
+	out := claudeJSONResult{Type: "result", Result: "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass", SessionID: "s1"}
+	b, _ := json.Marshal(out)
+
+	repo := t.TempDir()
+	r := &Runner{RepoPath: repo, Home: t.TempDir(), ClaudeBinary: writeFakeClaude(t, string(b), 0)}
+	r.SetModelEffort("haiku", "low")
+
+	res, err := r.RunReview(context.Background(), "https://app.clickup.com/t/123", "", CallOptions{})
+	if err != nil {
+		t.Fatalf("RunReview error: %v", err)
+	}
+	if res.Model != "haiku" || res.Effort != "low" {
+		t.Errorf("Result.Model/Effort = %q/%q, want haiku/low", res.Model, res.Effort)
 	}
 }

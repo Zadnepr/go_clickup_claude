@@ -56,11 +56,23 @@ func TestDecide_Fail_FallsBackToAssigneeOnFailWhenNoDeveloperField(t *testing.T)
 	}
 }
 
-func TestDecide_Fail_FallsBackToAssigneeOnPassWhenNoDeveloperFieldOrFailConfig(t *testing.T) {
+func TestDecide_Fail_NeverFallsBackToAssigneeOnPass(t *testing.T) {
+	// ASSIGNEE_ON_PASS — роль проверяющего, не разработчика: если его
+	// оставить в резерве для fail, ревьюер с прошлого pass-прогона так и
+	// останется висеть на задаче, ушедшей в rework, хотя он не может её
+	// исправить. Без Developer-поля и без ASSIGNEE_ON_FAIL резерв — создатель.
 	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnPass: "10"}
 	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, nil)
-	if len(assignees) != 1 || assignees[0] != 10 {
-		t.Errorf("expected fallback to ASSIGNEE_ON_PASS, got: %+v", assignees)
+	if len(assignees) != 1 || assignees[0] != 999 {
+		t.Errorf("expected fallback straight to the creator (ASSIGNEE_ON_PASS must not apply on fail), got: %+v", assignees)
+	}
+}
+
+func TestDecide_Fail_AssigneeOnFailWinsOverAssigneeOnPass(t *testing.T) {
+	cfg := &config.Config{StatusPass: "done", StatusFail: "to fix", AssigneeOnFail: "20", AssigneeOnPass: "10"}
+	_, assignees := Decide(review.Verdict{Status: review.StatusFail}, cfg, 999, nil)
+	if len(assignees) != 1 || assignees[0] != 20 {
+		t.Errorf("expected ASSIGNEE_ON_FAIL (20) to win, ASSIGNEE_ON_PASS must not apply on fail, got: %+v", assignees)
 	}
 }
 

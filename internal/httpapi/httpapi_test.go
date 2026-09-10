@@ -59,15 +59,16 @@ func (f *fakeSubmitter) SubmitResume(taskID string) bool {
 }
 
 type fakePinger struct {
-	err         error
-	active      []store.Run
-	stats       store.Stats
-	statsErr    error
-	statsSince  time.Time
-	run         *store.Run
-	runErr      error
-	stages      []store.RunStage
-	invocations []store.ClaudeInvocation
+	err          error
+	active       []store.Run
+	stats        store.Stats
+	statsErr     error
+	statsSince   time.Time
+	run          *store.Run
+	runErr       error
+	stages       []store.RunStage
+	invocations  []store.ClaudeInvocation
+	settingCalls map[string]string
 }
 
 func (f *fakePinger) Ping(ctx context.Context) error { return f.err }
@@ -100,14 +101,26 @@ func (f *fakePinger) ListInvocationsSince(ctx context.Context, since time.Time) 
 	return f.invocations, nil
 }
 
+func (f *fakePinger) SetSetting(ctx context.Context, key, value string) error {
+	if f.settingCalls == nil {
+		f.settingCalls = map[string]string{}
+	}
+	f.settingCalls[key] = value
+	return nil
+}
+
 type fakeManualRunner struct {
 	submitted []string
 	taskIDArg string
+	modelArg  string
+	effortArg string
 	err       error
 }
 
-func (f *fakeManualRunner) RunNow(ctx context.Context, taskID string) ([]string, error) {
+func (f *fakeManualRunner) RunNow(ctx context.Context, taskID, model, effort string) ([]string, error) {
 	f.taskIDArg = taskID
+	f.modelArg = model
+	f.effortArg = effort
 	if f.err != nil {
 		return nil, f.err
 	}

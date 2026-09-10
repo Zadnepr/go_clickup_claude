@@ -16,10 +16,13 @@ import (
 )
 
 type fakeClickUpReader struct {
-	task    *clickup.Task
-	taskErr error
-	members []clickup.Member
-	memErr  error
+	task       *clickup.Task
+	taskErr    error
+	members    []clickup.Member
+	memErr     error
+	otherTasks []clickup.Task
+	otherErr   error
+	gotStatus  string
 }
 
 func (f *fakeClickUpReader) GetTask(ctx context.Context, taskID string) (*clickup.Task, error) {
@@ -29,6 +32,24 @@ func (f *fakeClickUpReader) GetTask(ctx context.Context, taskID string) (*clicku
 func (f *fakeClickUpReader) GetTeamMembers(ctx context.Context) ([]clickup.Member, error) {
 	return f.members, f.memErr
 }
+
+func (f *fakeClickUpReader) ListTasksByStatus(ctx context.Context, listID, status string) ([]clickup.Task, error) {
+	f.gotStatus = status
+	return f.otherTasks, f.otherErr
+}
+
+// fakeRunnerControl — фейковая реализация RunnerControl.
+type fakeRunnerControl struct {
+	model, effort string
+	setCalled     bool
+}
+
+func (f *fakeRunnerControl) SetModelEffort(model, effort string) {
+	f.setCalled = true
+	f.model, f.effort = model, effort
+}
+
+func (f *fakeRunnerControl) ModelEffort() (string, string) { return f.model, f.effort }
 
 func TestConfigHandler_ReturnsSanitizedSettingsWithResolvedAssignee(t *testing.T) {
 	cfg := &config.Config{
@@ -261,5 +282,122 @@ func TestDashboardHandler_UnknownPath_Returns404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestSetModelHandler_ChangesLiveRunnerAndPersists(t *testing.T) {
+	runner := &fakeRunnerControl{model: "sonnet", effort: "high"}
+	st := &fakePinger{}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: st, Runner: runner, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	body := bytes.NewReader([]byte(`{"model":"haiku","effort":"low"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/config/model", body)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	if !runner.setCalled || runner.model != "haiku" || runner.effort != "low" {
+		t.Errorf("expected live runner updated to haiku/low, got: %+v", runner)
+	}
+	if st.settingCalls["claude_model"] != "haiku" || st.settingCalls["claude_effort"] != "low" {
+		t.Errorf("expected settings persisted, got: %+v", st.settingCalls)
+	}
+}
+
+func TestSetModelHandler_InvalidEffort_Returns400(t *testing.T) {
+	runner := &fakeRunnerControl{}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: &fakePinger{}, Runner: runner, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	body := bytes.NewReader([]byte(`{"model":"haiku","effort":"turbo"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/config/model", body)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if runner.setCalled {
+		t.Error("expected the runner not to be updated for an invalid effort")
+	}
+}
+
+func TestSetModelHandler_MissingModel_Returns400(t *testing.T) {
+	deps := Deps{Queue: &fakeSubmitter{}, Store: &fakePinger{}, Runner: &fakeRunnerControl{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	body := bytes.NewReader([]byte(`{"effort":"low"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/config/model", body)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestQueueHandler_OtherToCheck_ExcludesTaggedTasks(t *testing.T) {
+	cfg := &config.Config{CUListID: "list1", StatusTrigger: "to check", TriggerTag: "ai"}
+	cu := &fakeClickUpReader{otherTasks: []clickup.Task{
+		{ID: "1", Name: "Tagged", Tags: []string{"AI"}},    // уже с тегом (регистр не важен) — не должен попасть в other_to_check
+		{ID: "2", Name: "Untagged", Tags: []string{"bug"}}, // без нужного тега
+	}}
+	deps := Deps{Queue: &fakeSubmitter{}, Store: &fakePinger{}, ClickUp: cu, Cfg: cfg, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		OtherToCheck []struct {
+			TaskID string `json:"task_id"`
+		} `json:"other_to_check"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.OtherToCheck) != 1 || body.OtherToCheck[0].TaskID != "2" {
+		t.Errorf("expected only the untagged task, got: %+v", body.OtherToCheck)
+	}
+	if cu.gotStatus != "to check" {
+		t.Errorf("expected ListTasksByStatus called with the trigger status, got %q", cu.gotStatus)
+	}
+}
+
+func TestRunHandler_PassesModelEffortToManualRunner(t *testing.T) {
+	trigger := &fakeManualRunner{submitted: []string{"123"}}
+	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewReader([]byte(`{"task_id":"123","model":"haiku","effort":"low"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body: %s", rec.Code, rec.Body.String())
+	}
+	if trigger.modelArg != "haiku" || trigger.effortArg != "low" {
+		t.Errorf("expected model/effort passed through to RunNow, got model=%q effort=%q", trigger.modelArg, trigger.effortArg)
+	}
+}
+
+func TestRunHandler_InvalidEffort_Returns400(t *testing.T) {
+	trigger := &fakeManualRunner{}
+	deps := Deps{Queue: &fakeSubmitter{}, Trigger: trigger, Store: &fakePinger{}, Logger: discardLogger()}
+	mux := NewMux(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewReader([]byte(`{"task_id":"123","effort":"turbo"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }

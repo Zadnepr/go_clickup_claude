@@ -76,16 +76,22 @@ func (f *fakeClickUp) AddComment(ctx context.Context, taskID, text string) error
 
 // fakeRunner — фейковая реализация интерфейса Runner.
 type fakeRunner struct {
-	specErr      error
-	specContent  string // то, что вернёт RunSpec как собранное ТЗ ("" — /spec не собрала ТЗ)
-	specUsage    review.TokenUsage
-	result       review.Result
-	reviewErr    error
-	gitErr       error
-	gotSpecPath  string // specPath, с которым реально вызвали RunReview
-	reviewCalled bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
-	specCalled   bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
-	afterSpec    func() // если задано, вызывается в конце RunSpec — используется, чтобы смоделировать RequestPause/RequestCancel "между этапами" в тестах
+	specErr       error
+	specContent   string // то, что вернёт RunSpec как собранное ТЗ ("" — /spec не собрала ТЗ)
+	specUsage     review.TokenUsage
+	result        review.Result
+	reviewErr     error
+	gitErr        error
+	gotSpecPath   string // specPath, с которым реально вызвали RunReview
+	reviewCalled  bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
+	specCalled    bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
+	afterSpec     func() // если задано, вызывается в конце RunSpec — используется, чтобы смоделировать RequestPause/RequestCancel "между этапами" в тестах
+	gotSpecOpts   review.CallOptions
+	gotReviewOpts review.CallOptions
+
+	modelMu sync.Mutex
+	model   string
+	effort  string
 
 	specDirOnce sync.Once
 	specDir     string
@@ -93,8 +99,9 @@ type fakeRunner struct {
 
 func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
 
-func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string, onUsage func(review.TokenUsage)) (review.SpecResult, error) {
+func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string, opts review.CallOptions) (review.SpecResult, error) {
 	f.specCalled = true
+	f.gotSpecOpts = opts
 	if f.afterSpec != nil {
 		f.afterSpec()
 	}
@@ -107,13 +114,26 @@ func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string, onUsage func(r
 	return review.SpecResult{SessionID: "spec-session", Content: f.specContent, Usage: f.specUsage}, f.specErr
 }
 
-func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string, onUsage func(review.TokenUsage)) (review.Result, error) {
+func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string, opts review.CallOptions) (review.Result, error) {
 	f.reviewCalled = true
 	f.gotSpecPath = specPath
+	f.gotReviewOpts = opts
 	if err := ctx.Err(); err != nil {
 		return review.Result{}, err
 	}
 	return f.result, f.reviewErr
+}
+
+func (f *fakeRunner) SetModelEffort(model, effort string) {
+	f.modelMu.Lock()
+	defer f.modelMu.Unlock()
+	f.model, f.effort = model, effort
+}
+
+func (f *fakeRunner) ModelEffort() (string, string) {
+	f.modelMu.Lock()
+	defer f.modelMu.Unlock()
+	return f.model, f.effort
 }
 
 // SpecFilePath отдаёт путь во временном каталоге, приватном для этого
@@ -224,7 +244,7 @@ func TestProcessTask_PassVerdict_FullPipeline(t *testing.T) {
 
 	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("1")
+	q.processTask("1", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -256,7 +276,7 @@ func TestProcessTask_FailVerdict_AssignsConfiguredUser(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("2")
+	q.processTask("2", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -281,7 +301,7 @@ func TestProcessTask_ReviewProcessError_MarksRunFailedAndNotifies(t *testing.T) 
 
 	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("3")
+	q.processTask("3", RunOptions{})
 
 	if len(*calls) != 2 {
 		t.Fatalf("expected 2 slack notifications (started + service error), got %d", len(*calls))
@@ -327,7 +347,7 @@ func TestProcessTask_UsageLimitFromReview_PausesQueueAndRestoresState(t *testing
 	cfg := testConfig(t)
 	deps, _, calls := newTestDeps(t, cu, runner, cfg)
 	q := New(deps, 10)
-	q.processTask("4")
+	q.processTask("4", RunOptions{})
 
 	// Карточка должна вернуться в исходное состояние: статус — обратно на
 	// триггерный, снятый на время проверки исполнитель — восстановлен.
@@ -378,7 +398,7 @@ func TestProcessTask_UsageLimitFromSpec_SkipsReviewAndPauses(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("5")
+	q.processTask("5", RunOptions{})
 
 	if runner.reviewCalled {
 		t.Error("expected /review not to run when /spec already hit the usage limit")
@@ -402,7 +422,7 @@ func TestProcessTask_SkippedWhilePaused(t *testing.T) {
 	q := New(deps, 10)
 	q.pauseFor(time.Minute, "test pause")
 
-	q.processTask("6")
+	q.processTask("6", RunOptions{})
 
 	cu.mu.Lock()
 	if len(cu.statuses) != 0 {
@@ -427,7 +447,7 @@ func TestProcessTask_NotEligible_SkipsWithoutDedupRecord(t *testing.T) {
 
 	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("4")
+	q.processTask("4", RunOptions{})
 
 	if len(*calls) != 0 {
 		t.Fatalf("expected no slack notification for ineligible task, got %d", len(*calls))
@@ -459,7 +479,7 @@ func TestProcessTask_SkipsWhileAlreadyRunning(t *testing.T) {
 	}
 
 	q := New(deps, 10)
-	q.processTask("5")
+	q.processTask("5", RunOptions{})
 
 	if len(*calls) != 0 {
 		t.Fatalf("expected no processing while a run for this task is already active, got %d slack calls", len(*calls))
@@ -489,8 +509,8 @@ func TestProcessTask_ReprocessesAfterPreviousRunDone(t *testing.T) {
 	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
 
-	q.processTask("5")
-	q.processTask("5") // тег/статус выставлены заново после первой проверки
+	q.processTask("5", RunOptions{})
+	q.processTask("5", RunOptions{}) // тег/статус выставлены заново после первой проверки
 
 	if len(*calls) != 4 {
 		t.Fatalf("expected 2 full runs worth of notifications (started+finished twice), got %d", len(*calls))
@@ -514,7 +534,7 @@ func TestProcessTask_RemovesAssigneesBeforeCheck(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("6")
+	q.processTask("6", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -546,7 +566,7 @@ func TestProcessTask_Fail_FallsBackToCreatorWhenNothingConfigured(t *testing.T) 
 	cfg.AssigneeOnFail = ""
 	deps, _, _ := newTestDeps(t, cu, runner, cfg)
 	q := New(deps, 10)
-	q.processTask("7")
+	q.processTask("7", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -574,7 +594,7 @@ func TestProcessTask_Fail_PrefersDeveloperCustomFieldOverAssigneeOnFail(t *testi
 	// field Developer на задаче важнее — именно он должен победить.
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("22")
+	q.processTask("22", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -596,7 +616,7 @@ func TestProcessTask_RemovesTriggerTagAfterFinishing(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("8")
+	q.processTask("8", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -614,7 +634,7 @@ func TestProcessTask_MissingRequiredCommands_AbortsWithoutRunningReview(t *testi
 	cfg.RepoPath = t.TempDir() // пустой репозиторий, без .claude/commands
 	deps, _, calls := newTestDeps(t, cu, runner, cfg)
 	q := New(deps, 10)
-	q.processTask("9")
+	q.processTask("9", RunOptions{})
 
 	cu.mu.Lock()
 	commentsPosted := len(cu.comments)
@@ -654,7 +674,7 @@ func TestProcessTask_UsesCustomIDForSpecFileWhenPresent(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("10")
+	q.processTask("10", RunOptions{})
 
 	want := filepath.Join("specs", "PNL-4528.md")
 	if runner.gotSpecPath != want {
@@ -848,7 +868,7 @@ func TestProcessTask_ManualPause_StopsBeforeReviewAndCanBeResumed(t *testing.T) 
 	// прогон на границе перед /review, не вызывая его вовсе.
 	runner.afterSpec = func() { q.RequestPause("30") }
 
-	q.processTask("30")
+	q.processTask("30", RunOptions{})
 
 	if runner.reviewCalled {
 		t.Fatal("expected RunReview not to be called once a pause was requested before it")
@@ -895,7 +915,7 @@ func TestProcessTask_ManualCancel_StopsRunAndMarksFailed(t *testing.T) {
 		}
 	}
 
-	q.processTask("31")
+	q.processTask("31", RunOptions{})
 
 	run, err := deps.Store.GetRun(context.Background(), 1)
 	if err != nil {
@@ -906,6 +926,33 @@ func TestProcessTask_ManualCancel_StopsRunAndMarksFailed(t *testing.T) {
 	}
 	if len(q.ActiveRuns()) != 0 {
 		t.Error("expected no active runs left registered after the run finished")
+	}
+}
+
+func TestProcessTask_PerRunModelEffortOverride_PassedToRunnerCalls(t *testing.T) {
+	task := &clickup.Task{
+		ID: "32", Name: "Task 32", URL: "https://app.clickup.com/t/32",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specContent: "spec content",
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+	runner.SetModelEffort("sonnet", "high") // дефолт очереди — не должен использоваться для этого прогона
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	q.processTask("32", RunOptions{Model: "haiku", Effort: "low"})
+
+	if runner.gotSpecOpts.Model != "haiku" || runner.gotSpecOpts.Effort != "low" {
+		t.Errorf("expected RunSpec to receive the per-run override, got: %+v", runner.gotSpecOpts)
+	}
+	if runner.gotReviewOpts.Model != "haiku" || runner.gotReviewOpts.Effort != "low" {
+		t.Errorf("expected RunReview to receive the per-run override, got: %+v", runner.gotReviewOpts)
 	}
 }
 
@@ -1000,7 +1047,7 @@ func TestProcessTask_CommentExcludesSessionLineAndVerdictLine(t *testing.T) {
 
 	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
 	q := New(deps, 10)
-	q.processTask("14")
+	q.processTask("14", RunOptions{})
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()

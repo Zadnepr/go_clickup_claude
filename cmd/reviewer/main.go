@@ -105,6 +105,10 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	notifier := slack.NewNotifier(cfg.SlackWebhookURL)
 	runner := review.NewRunner(cfg.RepoPath, cfg.Home, cfg.ClaudeModel, cfg.ClaudeEffort)
+	// Настройки, изменённые через веб-интерфейс (PUT /api/config/model),
+	// переживают перезапуск сервиса в БД (см. store.SetSetting) — если там
+	// что-то есть, оно приоритетнее .env, потому что оно новее.
+	applyStoredModelEffort(context.Background(), st, runner, logger)
 
 	q := queue.New(queue.Deps{
 		ClickUp: cuClient,
@@ -129,6 +133,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		WebhookSecret: cfg.CUWebhookSecret,
 		Store:         st,
 		ClickUp:       cuClient,
+		Runner:        runner,
 		Cfg:           cfg,
 		RepoPath:      cfg.RepoPath,
 		ClaudeBinary:  "claude",
@@ -242,6 +247,28 @@ func scanAndSubmit(ctx context.Context, cfg *config.Config, cuClient *clickup.Cl
 	return ids, nil
 }
 
+// applyStoredModelEffort применяет модель/effort, сохранённые через
+// PUT /api/config/model в предыдущем запуске сервиса (см. store.SetSetting),
+// поверх значений из .env — БД приоритетнее, потому что она новее (веб-
+// интерфейс мог поменять модель уже после того, как .env был прочитан в
+// прошлый раз). Если в БД ничего не сохранено — значения из .env остаются
+// как есть (уже применены через review.NewRunner).
+func applyStoredModelEffort(ctx context.Context, st *store.Store, runner *review.Runner, logger *slog.Logger) {
+	model, effort := runner.ModelEffort()
+	if v, ok, err := st.GetSetting(ctx, httpapi.SettingClaudeModel); err != nil {
+		logger.Error("failed to load stored claude_model setting", "error", err.Error())
+	} else if ok {
+		model = v
+	}
+	if v, ok, err := st.GetSetting(ctx, httpapi.SettingClaudeEffort); err != nil {
+		logger.Error("failed to load stored claude_effort setting", "error", err.Error())
+	} else if ok {
+		effort = v
+	}
+	runner.SetModelEffort(model, effort)
+	logger.Info("claude model/effort in effect", "model", model, "effort", effort)
+}
+
 // manualRunner реализует httpapi.ManualRunner: ручной запуск конкретной
 // задачи (если передан task_id) или немедленное пересканирование доски
 // (та же логика, что и у сверки).
@@ -252,9 +279,12 @@ type manualRunner struct {
 	logger   *slog.Logger
 }
 
-func (m *manualRunner) RunNow(ctx context.Context, taskID string) ([]string, error) {
+func (m *manualRunner) RunNow(ctx context.Context, taskID, model, effort string) ([]string, error) {
 	if taskID != "" {
-		m.queue.Submit(taskID)
+		// model/effort — переопределение только на этот прогон (см.
+		// Требование «выбрать модель для текущей задачи»); для массового
+		// пересканирования ниже это не имеет смысла и игнорируется.
+		m.queue.SubmitWithOptions(taskID, queue.RunOptions{Model: model, Effort: effort})
 		return []string{taskID}, nil
 	}
 	ids, err := scanAndSubmit(ctx, m.cfg, m.cuClient, m.queue)

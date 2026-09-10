@@ -29,12 +29,15 @@ func Decide(v review.Verdict, cfg *config.Config, creatorID int, developerIDs []
 	}
 
 	// Приоритет при провале: custom field "Developer" → ASSIGNEE_ON_FAIL →
-	// ASSIGNEE_ON_PASS → создатель задачи.
+	// создатель задачи. ASSIGNEE_ON_PASS сюда намеренно не входит: это роль
+	// проверяющего/ревьюера, а не разработчика — если задача уходит в rework,
+	// назначать её на человека, который не может её исправить, бессмысленно.
+	// Раньше ASSIGNEE_ON_PASS был здесь как резерв, но на практике это
+	// привело к тому, что после fail на задаче так и оставался проверяющий
+	// с прошлого pass-прогона, хотя в custom field Developer его не было.
 	if len(developerIDs) > 0 {
 		assigneeIDs = append(assigneeIDs, developerIDs...)
 	} else if id, ok := parseUserID(cfg.AssigneeOnFail); ok {
-		assigneeIDs = []int{id}
-	} else if id, ok := parseUserID(cfg.AssigneeOnPass); ok {
 		assigneeIDs = []int{id}
 	} else if creatorID != 0 {
 		assigneeIDs = []int{creatorID}

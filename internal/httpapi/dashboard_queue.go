@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/Zadnepr/go_clickup_claude/internal/config"
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
@@ -23,10 +24,22 @@ type activeRunView struct {
 	Stages       []store.RunStage `json:"stages"`
 }
 
+// otherTaskView — одна задача из колонки-триггера без тега-триггера (см.
+// Требование «список задач без тега для ручного запуска») — сверка её не
+// возьмёт сама, но её можно запустить вручную через дашборд.
+type otherTaskView struct {
+	TaskID   string `json:"task_id"`
+	CustomID string `json:"custom_id,omitempty"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+}
+
 // newQueueHandler обрабатывает GET /api/queue: текущая(-ие) задача(-и) в
 // обработке прямо сейчас — с прогрессом по этапам и живым расходом
-// токенов, для управления (прервать/пауза) — и список задач, ожидающих
-// своей очереди в буфере (см. Требование «список задач в очереди»).
+// токенов, для управления (прервать/пауза) — список задач, ожидающих своей
+// очереди в буфере (см. Требование «список задач в очереди»), и отдельно —
+// остальные задачи в колонке-триггере, у которых просто нет тега-триггера
+// (сверка их не подхватит сама, см. Требование «список задач без тега»).
 func newQueueHandler(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -58,10 +71,38 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 			active = append(active, view)
 		}
 
+		otherToCheck := []otherTaskView{}
+		if deps.ClickUp != nil && deps.Cfg != nil && deps.Cfg.StatusTrigger != "" {
+			tasks, err := deps.ClickUp.ListTasksByStatus(ctx, deps.Cfg.CUListID, deps.Cfg.StatusTrigger)
+			if err != nil {
+				deps.Logger.Warn("failed to list other tasks in the trigger status", "error", err.Error())
+			} else {
+				wantTag := config.NormalizeStatus(deps.Cfg.TriggerTag)
+				for _, task := range tasks {
+					if taskHasTag(task.Tags, wantTag) {
+						continue
+					}
+					otherToCheck = append(otherToCheck, otherTaskView{
+						TaskID: task.ID, CustomID: task.CustomID, Name: task.Name, URL: task.URL,
+					})
+				}
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"active":  active,
-			"pending": deps.Queue.Pending(),
+			"active":         active,
+			"pending":        deps.Queue.Pending(),
+			"other_to_check": otherToCheck,
 		})
 	}
+}
+
+func taskHasTag(tags []string, wantNormalized string) bool {
+	for _, t := range tags {
+		if config.NormalizeStatus(t) == wantNormalized {
+			return true
+		}
+	}
+	return false
 }

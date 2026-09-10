@@ -42,13 +42,18 @@ type ClickUp interface {
 // Runner — часть API запуска claude, нужная воркеру очереди.
 type Runner interface {
 	GitFetch(ctx context.Context) error
-	RunSpec(ctx context.Context, taskURL string, onUsage func(review.TokenUsage)) (review.SpecResult, error)
-	RunReview(ctx context.Context, taskURL, specPath string, onUsage func(review.TokenUsage)) (review.Result, error)
+	RunSpec(ctx context.Context, taskURL string, opts review.CallOptions) (review.SpecResult, error)
+	RunReview(ctx context.Context, taskURL, specPath string, opts review.CallOptions) (review.Result, error)
 	// SpecFilePath — путь, по которому нужно сохранить (не сама /spec —
 	// см. Queue.runReview) содержимое собранного ТЗ, чтобы /review могла
 	// прочитать его тулом Read. Источник истины для этого содержимого —
 	// БД (specStageData.Content), файл — лишь производный от неё артефакт.
 	SpecFilePath(taskID string) string
+	// SetModelEffort/ModelEffort — модель/effort по умолчанию для вызовов
+	// без собственного переопределения (см. RunOptions в control.go) —
+	// меняются на лету через веб-интерфейс (см. httpapi.RunnerControl).
+	SetModelEffort(model, effort string)
+	ModelEffort() (model, effort string)
 }
 
 // Deps — зависимости, нужные очереди для обработки задач.
@@ -113,8 +118,10 @@ func missingCommands(repoPath string) []string {
 
 // processTask прогоняет одну задачу через полный цикл: проверка условия,
 // дедупликация, перевод в running, /spec+/review, переходы статуса и
-// исполнителя, комментарий, уведомление в Slack и в лог.
-func (q *Queue) processTask(taskID string) {
+// исполнителя, комментарий, уведомление в Slack и в лог. opts — переопределение
+// модели/effort claude на этот конкретный прогон (см. RunOptions), обычно
+// нулевое (использовать текущее значение по умолчанию).
+func (q *Queue) processTask(taskID string, opts RunOptions) {
 	cfg := q.deps.Cfg
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ReviewTimeout)
 	defer cancel()
@@ -149,7 +156,7 @@ func (q *Queue) processTask(taskID string) {
 
 	q.registerActive(taskID, runID, cancel)
 	defer q.unregisterActive(taskID)
-	q.runReview(ctx, log, task, runID)
+	q.runReview(ctx, log, task, runID, opts)
 }
 
 // resumeTask доводит до конца прогон, прерванный крахом или убийством
@@ -192,7 +199,7 @@ func (q *Queue) resumeTask(taskID string) {
 	log.Info("resuming review interrupted by a previous instance")
 	q.registerActive(taskID, runID, cancel)
 	defer q.unregisterActive(taskID)
-	q.runReview(ctx, log, task, runID)
+	q.runReview(ctx, log, task, runID, RunOptions{})
 }
 
 // runReview прогоняет одну задачу через полный цикл поэтапно (см. stage.go):
@@ -203,7 +210,7 @@ func (q *Queue) resumeTask(taskID string) {
 // выполняются заново: /spec и /review — самые дорогие вызовы во всём цикле,
 // и именно их результат («результат /spec сохранялся в табличку») не нужно
 // терять при возобновлении.
-func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64) {
+func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64, opts RunOptions) {
 	cfg := q.deps.Cfg
 
 	if err := q.deps.Store.MarkRunning(ctx, runID); err != nil {
@@ -265,12 +272,15 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	spec, _, specErr := stageRun(ctx, q, log, runID, stageSpec, func() (specStageData, error) {
-		sr, err := q.deps.Runner.RunSpec(ctx, task.URL, func(u review.TokenUsage) {
-			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(u))
+		sr, err := q.deps.Runner.RunSpec(ctx, task.URL, review.CallOptions{
+			Model: opts.Model, Effort: opts.Effort,
+			OnUsage: func(u review.TokenUsage) {
+				q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(u))
+			},
 		})
 		q.logAndRecordInvocation(ctx, log, runID, stageSpec, invocationLog{
 			SessionID: sr.SessionID, Prompt: sr.Prompt, Output: sr.Content, Stderr: sr.Stderr,
-			Subtype: sr.Subtype, IsError: sr.IsError, Usage: sr.Usage,
+			Subtype: sr.Subtype, IsError: sr.IsError, Usage: sr.Usage, Model: sr.Model, Effort: sr.Effort,
 			StartedAt: sr.StartedAt, FinishedAt: sr.FinishedAt,
 		})
 		if err != nil {
@@ -308,12 +318,15 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	}
 
 	reviewData, _, reviewErr := stageRun(ctx, q, log, runID, stageReview, func() (reviewStageData, error) {
-		result, err := q.deps.Runner.RunReview(ctx, task.URL, specPath, func(u review.TokenUsage) {
-			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(spec.Usage.Add(u)))
+		result, err := q.deps.Runner.RunReview(ctx, task.URL, specPath, review.CallOptions{
+			Model: opts.Model, Effort: opts.Effort,
+			OnUsage: func(u review.TokenUsage) {
+				q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(spec.Usage.Add(u)))
+			},
 		})
 		q.logAndRecordInvocation(ctx, log, runID, stageReview, invocationLog{
 			SessionID: result.SessionID, Prompt: result.Prompt, Output: result.Output, Stderr: result.Stderr,
-			Subtype: result.Subtype, IsError: result.IsError, Usage: result.Usage,
+			Subtype: result.Subtype, IsError: result.IsError, Usage: result.Usage, Model: result.Model, Effort: result.Effort,
 			StartedAt: result.StartedAt, FinishedAt: result.FinishedAt,
 		})
 		return reviewStageData{SessionID: result.SessionID, Output: result.Output, Stderr: result.Stderr, Usage: result.Usage}, err
@@ -544,13 +557,18 @@ func (q *Queue) ensureSpecFile(log *slog.Logger, spec specStageData) string {
 // Queue.logAndRecordInvocation) — отдельно от review.Result/SpecResult,
 // чтобы не завязывать это на конкретный из двух типов.
 type invocationLog struct {
-	SessionID  string
-	Prompt     string
-	Output     string
-	Stderr     string
-	Subtype    string
-	IsError    bool
-	Usage      review.TokenUsage
+	SessionID string
+	Prompt    string
+	Output    string
+	Stderr    string
+	Subtype   string
+	IsError   bool
+	Usage     review.TokenUsage
+	// Model/Effort — то, что было реально использовано для этого вызова
+	// (см. review.Result.Model/Effort), а не текущая конфигурация: та могла
+	// уже смениться (см. RunnerControl.SetModelEffort) к моменту записи.
+	Model      string
+	Effort     string
 	StartedAt  time.Time
 	FinishedAt time.Time
 }
@@ -564,13 +582,13 @@ type invocationLog struct {
 func (q *Queue) logAndRecordInvocation(ctx context.Context, log *slog.Logger, runID int64, stage string, inv invocationLog) {
 	log.Info("claude response",
 		"stage", stage, "session_id", inv.SessionID, "subtype", inv.Subtype, "is_error", inv.IsError,
+		"model", inv.Model, "effort", inv.Effort,
 		"input_tokens", inv.Usage.InputTokens, "output_tokens", inv.Usage.OutputTokens, "cost_usd", inv.Usage.CostUSD,
 		"duration", inv.FinishedAt.Sub(inv.StartedAt).Round(time.Second),
 		"output", truncateOutputForLog(inv.Output))
 
-	cfg := q.deps.Cfg
 	if _, err := q.deps.Store.RecordInvocation(ctx, store.ClaudeInvocation{
-		RunID: runID, Stage: stage, SessionID: inv.SessionID, Model: cfg.ClaudeModel, Effort: cfg.ClaudeEffort,
+		RunID: runID, Stage: stage, SessionID: inv.SessionID, Model: inv.Model, Effort: inv.Effort,
 		Prompt: inv.Prompt, Output: inv.Output, Stderr: inv.Stderr, Subtype: inv.Subtype, IsError: inv.IsError,
 		InputTokens: int64(inv.Usage.InputTokens), OutputTokens: int64(inv.Usage.OutputTokens), CostUSD: inv.Usage.CostUSD,
 		StartedAt: inv.StartedAt, FinishedAt: inv.FinishedAt,

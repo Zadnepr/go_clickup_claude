@@ -15,6 +15,15 @@ import (
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
+// Ключи в таблице settings (см. store.GetSetting/SetSetting) для модели и
+// effort claude, изменяемых через PUT /api/config/model — main.go читает их
+// при старте, чтобы применить сохранённое значение к Runner ещё до первого
+// прогона (см. Требование «менять модель и effort в веб-интерфейсе»).
+const (
+	SettingClaudeModel  = "claude_model"
+	SettingClaudeEffort = "claude_effort"
+)
+
 // Submitter — то немногое от очереди, что нужно вебхуку/сверке.
 type Submitter interface {
 	Submit(taskID string) bool
@@ -34,7 +43,8 @@ type QueueControl interface {
 }
 
 // DataStore — то немногое от Store, что нужно HTTP-слою: /readyz,
-// /api/status, /api/stats, /api/runs/{id} и /api/invocations.
+// /api/status, /api/stats, /api/runs/{id}, /api/invocations и сохранение
+// настроек, изменённых через веб-интерфейс (см. /api/config/model).
 type DataStore interface {
 	Ping(ctx context.Context) error
 	ListActive(ctx context.Context) ([]store.Run, error)
@@ -43,13 +53,25 @@ type DataStore interface {
 	ListStages(ctx context.Context, runID int64) ([]store.RunStage, error)
 	ListInvocations(ctx context.Context, runID int64) ([]store.ClaudeInvocation, error)
 	ListInvocationsSince(ctx context.Context, since time.Time) ([]store.ClaudeInvocation, error)
+	SetSetting(ctx context.Context, key, value string) error
 }
 
 // ClickUpReader — то немногое от ClickUp API, что нужно дашборду для
-// отображения текущей задачи и разрешения ID исполнителей в имя/аватар.
+// отображения текущей задачи, разрешения ID исполнителей в имя/аватар и
+// списка остальных задач в колонке-триггере без нужного тега.
 type ClickUpReader interface {
 	GetTask(ctx context.Context, taskID string) (*clickup.Task, error)
 	GetTeamMembers(ctx context.Context) ([]clickup.Member, error)
+	ListTasksByStatus(ctx context.Context, listID, status string) ([]clickup.Task, error)
+}
+
+// RunnerControl — то, что нужно веб-интерфейсу, чтобы менять модель/effort
+// claude на лету (см. Требование «менять модель и effort в веб-интерфейсе»),
+// без перезапуска сервиса. Реализуется тем же *review.Runner, что и очередь
+// использует для реальных вызовов claude — смена применяется сразу.
+type RunnerControl interface {
+	SetModelEffort(model, effort string)
+	ModelEffort() (model, effort string)
 }
 
 // Deps — зависимости HTTP-слоя.
@@ -59,6 +81,7 @@ type Deps struct {
 	WebhookSecret string       // пусто -> эндпоинт вебхука не регистрируется
 	Store         DataStore
 	ClickUp       ClickUpReader
+	Runner        RunnerControl
 	Cfg           *config.Config // для GET /api/config — секреты (токены) в ответ не идут
 	RepoPath      string
 	ClaudeBinary  string // по умолчанию "claude"
@@ -90,6 +113,7 @@ func NewMux(deps Deps) *http.ServeMux {
 	mux.HandleFunc("GET /api/status", newStatusHandler(deps))
 	mux.HandleFunc("GET /api/stats", newStatsHandler(deps))
 	mux.HandleFunc("GET /api/config", newConfigHandler(deps))
+	mux.HandleFunc("PUT /api/config/model", newSetModelHandler(deps))
 	mux.HandleFunc("GET /api/queue", newQueueHandler(deps))
 	mux.HandleFunc("GET /api/runs/{id}", newRunDetailHandler(deps))
 	mux.HandleFunc("GET /api/invocations", newInvocationsHandler(deps))

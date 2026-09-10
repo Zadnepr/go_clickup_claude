@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,29 +41,66 @@ type Runner struct {
 	RepoPath     string
 	Home         string
 	ClaudeBinary string
-	// Model/Effort — флаги --model/--effort (пусто — использовать выбор
-	// claude по умолчанию). См. config.Config.ClaudeModel/ClaudeEffort.
-	Model  string
-	Effort string
+
+	// modelMu защищает model/effort — значения по умолчанию для вызовов, у
+	// которых нет собственного переопределения (см. CallOptions). Меняются
+	// на лету через SetModelEffort (веб-интерфейс, см. Требование «менять
+	// модель и effort в веб-интерфейсе»), пока другие горутины могут в этот
+	// момент читать их для уже идущего вызова — отсюда мьютекс, а не голые
+	// строковые поля.
+	modelMu sync.RWMutex
+	model   string
+	effort  string
 }
 
 // NewRunner создаёт Runner с настоящим бинарником claude.
 func NewRunner(repoPath, home, model, effort string) *Runner {
-	return &Runner{RepoPath: repoPath, Home: home, ClaudeBinary: "claude", Model: model, Effort: effort}
+	r := &Runner{RepoPath: repoPath, Home: home, ClaudeBinary: "claude"}
+	r.SetModelEffort(model, effort)
+	return r
+}
+
+// SetModelEffort меняет модель/effort по умолчанию для всех последующих
+// вызовов, у которых нет собственного переопределения в CallOptions, —
+// используется веб-интерфейсом, чтобы поменять их без перезапуска сервиса.
+// Уже идущие вызовы claude этим не затрагиваются (значение читается один
+// раз в начале run).
+func (r *Runner) SetModelEffort(model, effort string) {
+	r.modelMu.Lock()
+	defer r.modelMu.Unlock()
+	r.model = model
+	r.effort = effort
+}
+
+// ModelEffort возвращает текущие модель/effort по умолчанию (см.
+// SetModelEffort) — используется, например, чтобы показать их в
+// веб-интерфейсе.
+func (r *Runner) ModelEffort() (model, effort string) {
+	r.modelMu.RLock()
+	defer r.modelMu.RUnlock()
+	return r.model, r.effort
 }
 
 // Result — итог запуска /review: полный текст ревью, id сессии для лога и
 // ссылки на прогон, служебные поля вызова claude (для лога и сохранения
 // в БД, см. store.ClaudeInvocation) и разобранный вердикт.
 type Result struct {
-	Output     string
-	SessionID  string
-	Stderr     string
-	Subtype    string
-	IsError    bool
-	Verdict    Verdict
-	Usage      TokenUsage
-	Prompt     string
+	Output    string
+	SessionID string
+	Stderr    string
+	Subtype   string
+	IsError   bool
+	Verdict   Verdict
+	Usage     TokenUsage
+	Prompt    string
+	// Model/Effort — то, что было реально использовано для этого вызова
+	// (после разрешения CallOptions.Model/Effort против текущих значений
+	// по умолчанию, см. Runner.SetModelEffort) — именно это, а не текущая
+	// конфигурация сервиса, должно попадать в лог/БД (см.
+	// store.ClaudeInvocation): конфигурация могла уже смениться к моменту
+	// записи, а этот вызов был сделан с тем, что было тогда.
+	Model      string
+	Effort     string
 	StartedAt  time.Time
 	FinishedAt time.Time
 }
@@ -80,8 +118,22 @@ type SpecResult struct {
 	IsError    bool
 	Usage      TokenUsage
 	Prompt     string
+	Model      string
+	Effort     string
 	StartedAt  time.Time
 	FinishedAt time.Time
+}
+
+// CallOptions — параметры одного вызова RunSpec/RunReview, помимо самой
+// задачи: OnUsage — колбэк с промежуточным расходом токенов (см. run);
+// Model/Effort — переопределение на этот конкретный вызов (например, при
+// ручном запуске из веб-интерфейса — см. Требование «выбрать модель для
+// текущей задачи»); пустая строка — использовать текущее значение по
+// умолчанию (см. Runner.SetModelEffort), а не отключить флаг вовсе.
+type CallOptions struct {
+	OnUsage func(TokenUsage)
+	Model   string
+	Effort  string
 }
 
 // TokenUsage — токены и стоимость одного вызова `claude -p`. Складывается
@@ -216,14 +268,14 @@ func (r *Runner) SpecFilePath(taskID string) string {
 // возвращает собранное ТЗ как обычный текст ответа — команда больше не
 // сохраняет файл сама (см. .claude/commands/spec.md, раздел 6): сохранение
 // в БД и на диск делает вызывающая сторона (см. queue.stageSpec).
-func (r *Runner) RunSpec(ctx context.Context, taskURL string, onUsage func(TokenUsage)) (SpecResult, error) {
+func (r *Runner) RunSpec(ctx context.Context, taskURL string, opts CallOptions) (SpecResult, error) {
 	prompt := "/spec\n" + taskURL
 	started := time.Now()
-	result, stderr, err := r.run(ctx, prompt, onUsage)
+	result, model, effort, stderr, err := r.run(ctx, prompt, opts)
 	sr := SpecResult{
 		Content: result.Result, SessionID: result.SessionID, Stderr: stderr,
 		Subtype: result.Subtype, IsError: result.IsError, Usage: result.tokenUsage(),
-		Prompt: prompt, StartedAt: started, FinishedAt: time.Now(),
+		Prompt: prompt, Model: model, Effort: effort, StartedAt: started, FinishedAt: time.Now(),
 	}
 	if err != nil {
 		return sr, fmt.Errorf("/spec run failed: %w (stderr: %s)", err, truncate(stderr, 2000))
@@ -234,17 +286,18 @@ func (r *Runner) RunSpec(ctx context.Context, taskURL string, onUsage func(Token
 // RunReview запускает "/review\n<url задачи>[\n<путь к спеке>]" отдельной
 // сессией claude и возвращает полный вывод, id сессии и разобранный вердикт.
 // specPath пустой означает, что готового ТЗ нет: /review соберёт его сама.
-func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string, onUsage func(TokenUsage)) (Result, error) {
+func (r *Runner) RunReview(ctx context.Context, taskURL, specPath string, opts CallOptions) (Result, error) {
 	prompt := "/review\n" + taskURL
 	if specPath != "" {
 		prompt += "\n" + specPath
 	}
 
 	started := time.Now()
-	result, stderr, err := r.run(ctx, prompt, onUsage)
+	result, model, effort, stderr, err := r.run(ctx, prompt, opts)
 	res := Result{
 		SessionID: result.SessionID, Stderr: stderr, Subtype: result.Subtype, IsError: result.IsError,
-		Usage: result.tokenUsage(), Prompt: prompt, StartedAt: started, FinishedAt: time.Now(),
+		Usage: result.tokenUsage(), Prompt: prompt, Model: model, Effort: effort,
+		StartedAt: started, FinishedAt: time.Now(),
 	}
 	if err != nil {
 		res.Verdict = Verdict{Status: StatusBlocked}
@@ -280,15 +333,28 @@ type streamAssistantUsage struct {
 const usageReportInterval = 2 * time.Second
 
 // run выполняет один процесс claude -p в потоковом режиме и возвращает
-// разобранную финальную строку ("result"). onUsage (может быть nil)
-// вызывается по ходу выполнения с токенами, потреблёнными до этого момента
-// сессии, — это и есть отслеживание расхода в реальном времени; финальные
-// точные цифры (включая стоимость) всё равно берутся из результирующей
-// строки после завершения процесса.
-func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage)) (claudeJSONResult, string, error) {
+// разобранную финальную строку ("result") вместе с фактическими model/effort
+// (после разрешения opts против текущих значений по умолчанию — см.
+// Runner.SetModelEffort). opts.OnUsage (может быть nil) вызывается по ходу
+// выполнения с токенами, потреблёнными до этого момента сессии, — это и
+// есть отслеживание расхода в реальном времени; финальные точные цифры
+// (включая стоимость) всё равно берутся из результирующей строки после
+// завершения процесса.
+func (r *Runner) run(ctx context.Context, prompt string, opts CallOptions) (result claudeJSONResult, model, effort, stderrOut string, err error) {
 	binary := r.ClaudeBinary
 	if binary == "" {
 		binary = "claude"
+	}
+
+	model, effort = opts.Model, opts.Effort
+	if model == "" || effort == "" {
+		defModel, defEffort := r.ModelEffort()
+		if model == "" {
+			model = defModel
+		}
+		if effort == "" {
+			effort = defEffort
+		}
 	}
 
 	// Список — объединение allowed-tools обеих команд (.claude/commands/spec.md
@@ -300,11 +366,11 @@ func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage
 	args := []string{"-p", prompt,
 		"--output-format", "stream-json", "--verbose",
 		"--allowedTools", "Bash(git:*)", "Bash(cup:*)", "Bash(notion-cli:*)", "Read", "Grep", "Glob"}
-	if r.Model != "" {
-		args = append(args, "--model", r.Model)
+	if model != "" {
+		args = append(args, "--model", model)
 	}
-	if r.Effort != "" {
-		args = append(args, "--effort", r.Effort)
+	if effort != "" {
+		args = append(args, "--effort", effort)
 	}
 
 	cmd := exec.CommandContext(ctx, binary, args...)
@@ -315,13 +381,13 @@ func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return claudeJSONResult{}, "", fmt.Errorf("open claude stdout pipe: %w", err)
+		return claudeJSONResult{}, model, effort, "", fmt.Errorf("open claude stdout pipe: %w", err)
 	}
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
-		return claudeJSONResult{}, "", fmt.Errorf("start claude process: %w", err)
+		return claudeJSONResult{}, model, effort, "", fmt.Errorf("start claude process: %w", err)
 	}
 
 	var final claudeJSONResult
@@ -348,7 +414,7 @@ func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage
 			json.Unmarshal(line, &final)
 			haveFinal = true
 		case "assistant":
-			if onUsage == nil {
+			if opts.OnUsage == nil {
 				continue
 			}
 			var evt streamAssistantUsage
@@ -362,7 +428,7 @@ func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage
 				continue
 			}
 			lastReport = time.Now()
-			onUsage(TokenUsage{
+			opts.OnUsage(TokenUsage{
 				InputTokens:  evt.Message.Usage.InputTokens,
 				OutputTokens: evt.Message.Usage.OutputTokens,
 			})
@@ -370,36 +436,36 @@ func (r *Runner) run(ctx context.Context, prompt string, onUsage func(TokenUsage
 	}
 	scanErr := scanner.Err()
 	runErr := cmd.Wait()
-	stderr := stderrBuf.String()
+	stderrText := stderrBuf.String()
 
 	if !haveFinal {
 		if runErr != nil {
-			if isUsageLimitMessage(stderr) {
-				return claudeJSONResult{}, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(stderr, 500))
+			if isUsageLimitMessage(stderrText) {
+				return claudeJSONResult{}, model, effort, stderrText, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(stderrText, 500))
 			}
-			return claudeJSONResult{}, stderr, fmt.Errorf("claude process failed: %w", runErr)
+			return claudeJSONResult{}, model, effort, stderrText, fmt.Errorf("claude process failed: %w", runErr)
 		}
 		detail := "no result event in claude output"
 		if scanErr != nil {
 			detail = scanErr.Error()
 		}
-		return claudeJSONResult{}, stderr, fmt.Errorf("parse claude json output: %s", detail)
+		return claudeJSONResult{}, model, effort, stderrText, fmt.Errorf("parse claude json output: %s", detail)
 	}
 
 	if runErr != nil {
-		if isUsageLimitMessage(final.Result) || isUsageLimitMessage(stderr) {
-			return final, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
+		if isUsageLimitMessage(final.Result) || isUsageLimitMessage(stderrText) {
+			return final, model, effort, stderrText, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
 		}
-		return final, stderr, fmt.Errorf("claude process failed: %w", runErr)
+		return final, model, effort, stderrText, fmt.Errorf("claude process failed: %w", runErr)
 	}
 	if final.IsError {
 		if isUsageLimitMessage(final.Result) {
-			return final, stderr, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
+			return final, model, effort, stderrText, fmt.Errorf("%w: %s", ErrUsageLimit, truncate(final.Result, 500))
 		}
-		return final, stderr, fmt.Errorf("claude reported an error: %s", final.Result)
+		return final, model, effort, stderrText, fmt.Errorf("claude reported an error: %s", final.Result)
 	}
 
-	return final, stderr, nil
+	return final, model, effort, stderrText, nil
 }
 
 func truncate(s string, n int) string {

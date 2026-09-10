@@ -321,6 +321,32 @@ func TestListTasksByTagAndStatus(t *testing.T) {
 	}
 }
 
+func TestListTasksByStatus_NoTagFilter(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("tags[]") {
+			t.Errorf("expected no tags[] filter, got query: %s", r.URL.RawQuery)
+		}
+		if r.URL.Query().Get("statuses[]") != "to check" {
+			t.Errorf("unexpected query: %s", r.URL.RawQuery)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"tasks": []map[string]any{
+				{"id": "1", "name": "A", "status": map[string]string{"status": "to check"}, "list": map[string]string{"id": "list1"}},
+				{"id": "2", "name": "B", "status": map[string]string{"status": "to check"}, "list": map[string]string{"id": "list1"},
+					"tags": []map[string]string{{"name": "ai"}}},
+			},
+		})
+	})
+
+	tasks, err := c.ListTasksByStatus(context.Background(), "list1", "to check")
+	if err != nil {
+		t.Fatalf("ListTasksByStatus error: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
 func TestCreateWebhook(t *testing.T) {
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/team/team1/webhook" {

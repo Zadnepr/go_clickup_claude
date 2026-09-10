@@ -635,6 +635,52 @@ func TestUpdateRunningUsage_UpdatesWithoutChangingStatus(t *testing.T) {
 	}
 }
 
+func TestGetSetting_NotSet_ReturnsOkFalse(t *testing.T) {
+	s := openTestStore(t)
+	_, ok, err := s.GetSetting(context.Background(), "claude_model")
+	if err != nil {
+		t.Fatalf("GetSetting error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected ok=false for an unset setting")
+	}
+}
+
+func TestSetSetting_ThenGetSetting_RoundTrips(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.SetSetting(ctx, "claude_model", "haiku"); err != nil {
+		t.Fatalf("SetSetting error: %v", err)
+	}
+	value, ok, err := s.GetSetting(ctx, "claude_model")
+	if err != nil {
+		t.Fatalf("GetSetting error: %v", err)
+	}
+	if !ok || value != "haiku" {
+		t.Errorf("value = %q, ok = %v, want haiku/true", value, ok)
+	}
+}
+
+func TestSetSetting_OverwritesExistingValue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.SetSetting(ctx, "claude_effort", "low"); err != nil {
+		t.Fatalf("SetSetting error: %v", err)
+	}
+	if err := s.SetSetting(ctx, "claude_effort", "high"); err != nil {
+		t.Fatalf("SetSetting error: %v", err)
+	}
+	value, ok, err := s.GetSetting(ctx, "claude_effort")
+	if err != nil {
+		t.Fatalf("GetSetting error: %v", err)
+	}
+	if !ok || value != "high" {
+		t.Errorf("value = %q, ok = %v, want high/true", value, ok)
+	}
+}
+
 func TestMigrateTokenColumns_IdempotentOnReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 
