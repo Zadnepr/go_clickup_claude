@@ -291,6 +291,65 @@ func (c *Client) GetTask(ctx context.Context, taskID string) (*Task, error) {
 	return task, nil
 }
 
+// Member — участник ClickUp-воркспейса (см. GetTeamMembers). Используется
+// для отображения имени/аватара по ID пользователя (ASSIGNEE_ON_FAIL/
+// ASSIGNEE_ON_PASS, custom field Developer, текущие исполнители) в
+// веб-интерфейсе — сам сервис по имени/аватару ничего не решает.
+type Member struct {
+	ID       int
+	Username string
+	Email    string
+	Color    string
+	Avatar   string
+}
+
+// GetTeamMembers возвращает участников воркспейса (team, заданного при
+// создании клиента). У ClickUp API v2 нет эндпоинта для одной команды по
+// id — приходится запрашивать список всех команд, доступных токену,
+// и выбирать нужную.
+func (c *Client) GetTeamMembers(ctx context.Context) ([]Member, error) {
+	body, err := c.doRequest(ctx, http.MethodGet, "/team", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list teams: %w", err)
+	}
+
+	var raw struct {
+		Teams []struct {
+			ID      string `json:"id"`
+			Members []struct {
+				User struct {
+					ID             int    `json:"id"`
+					Username       string `json:"username"`
+					Email          string `json:"email"`
+					Color          string `json:"color"`
+					ProfilePicture string `json:"profilePicture"`
+				} `json:"user"`
+			} `json:"members"`
+		} `json:"teams"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse teams response: %w", err)
+	}
+
+	for _, t := range raw.Teams {
+		if t.ID != c.teamID {
+			continue
+		}
+		members := make([]Member, 0, len(t.Members))
+		for _, m := range t.Members {
+			members = append(members, Member{
+				ID:       m.User.ID,
+				Username: m.User.Username,
+				Email:    m.User.Email,
+				Color:    m.User.Color,
+				Avatar:   m.User.ProfilePicture,
+			})
+		}
+		return members, nil
+	}
+	return nil, fmt.Errorf("team %s not found in /team response", c.teamID)
+}
+
 // ListStatuses возвращает названия статусов, доступных в списке (для диагностики
 // ошибок смены статуса — несуществующее имя колонки частая ошибка конфигурации).
 func (c *Client) ListStatuses(ctx context.Context, listID string) ([]string, error) {

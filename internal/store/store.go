@@ -76,13 +76,13 @@ const (
 // в рамках одного прогона (run_id), с данными, нужными, чтобы при
 // возобновлении не повторять этот этап заново (см. Queue.stage).
 type RunStage struct {
-	RunID      int64
-	Stage      string
-	Status     string
-	StartedAt  time.Time
-	FinishedAt sql.NullTime
-	Error      string
-	Data       json.RawMessage
+	RunID      int64           `json:"run_id"`
+	Stage      string          `json:"stage"`
+	Status     string          `json:"status"`
+	StartedAt  time.Time       `json:"started_at"`
+	FinishedAt sql.NullTime    `json:"finished_at"`
+	Error      string          `json:"error"`
+	Data       json.RawMessage `json:"data"`
 }
 
 // ClaudeInvocation — один вызов `claude -p` целиком: полный запрос и полный
@@ -91,22 +91,22 @@ type RunStage struct {
 // токенов по каждому вызову и для хранения полного текста ответа сессии
 // (см. README, раздел «Таблицы claude_invocations и run_stages»).
 type ClaudeInvocation struct {
-	ID           int64
-	RunID        int64
-	Stage        string
-	SessionID    string
-	Model        string
-	Effort       string
-	Prompt       string
-	Output       string
-	Stderr       string
-	Subtype      string
-	IsError      bool
-	InputTokens  int64
-	OutputTokens int64
-	CostUSD      float64
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	ID           int64     `json:"id"`
+	RunID        int64     `json:"run_id"`
+	Stage        string    `json:"stage"`
+	SessionID    string    `json:"session_id"`
+	Model        string    `json:"model"`
+	Effort       string    `json:"effort"`
+	Prompt       string    `json:"prompt"`
+	Output       string    `json:"output"`
+	Stderr       string    `json:"stderr"`
+	Subtype      string    `json:"subtype"`
+	IsError      bool      `json:"is_error"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
+	CostUSD      float64   `json:"cost_usd"`
+	StartedAt    time.Time `json:"started_at"`
+	FinishedAt   time.Time `json:"finished_at"`
 }
 
 // Store — обёртка над SQLite-базой с таблицей runs.
@@ -247,16 +247,29 @@ func (s *Store) Close() error {
 }
 
 // TryEnqueue атомарно создаёт запись о прогоне в статусе queued, если по
-// этой задаче нет записи в состоянии queued, running или done. Возвращает
-// enqueued=false, если запись уже блокирует постановку (дедупликация).
+// этой задаче нет записи в состоянии queued или running — только они
+// означают уже идущую обработку того же запроса (тот же тег ещё не снят).
+// Возвращает enqueued=false, если такая запись уже блокирует постановку
+// (дедупликация повторного вебхука/скана по одному и тому же запросу).
+//
+// done намеренно НЕ блокирует: тег-триггер снимается только на этапе decide
+// успешно завершённого прогона (см. Queue.runReview) — то есть к моменту,
+// когда прогон становится done, тег уже снят, и задача больше не матчится
+// условием триггера при сверке. Если тег и статус на задаче снова совпали
+// с условием — это не эхо старого запроса, а осознанный новый запрос на
+// повторную проверку (человек перетегировал задачу руками), и его нужно
+// обработать, а не отбросить молча из-за того, что когда-то раньше эта же
+// задача уже проверялась. failed так же не блокирует — это заведомо не
+// результат ревью, а инфраструктурный сбой, тег в этом случае не снимается,
+// и повторную попытку должна суметь запустить сама сверка.
 func (s *Store) TryEnqueue(ctx context.Context, taskID string) (runID int64, enqueued bool, err error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs (task_id, status, started_at)
 		SELECT ?, ?, ?
 		WHERE NOT EXISTS (
-			SELECT 1 FROM runs WHERE task_id = ? AND status IN (?, ?, ?)
+			SELECT 1 FROM runs WHERE task_id = ? AND status IN (?, ?)
 		)
-	`, taskID, StatusQueued, time.Now().UTC(), taskID, StatusQueued, StatusRunning, StatusDone)
+	`, taskID, StatusQueued, time.Now().UTC(), taskID, StatusQueued, StatusRunning)
 	if err != nil {
 		return 0, false, fmt.Errorf("enqueue task %s: %w", taskID, err)
 	}
@@ -537,6 +550,36 @@ func (s *Store) ListInvocations(ctx context.Context, runID int64) ([]ClaudeInvoc
 	`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list claude invocations of run %d: %w", runID, err)
+	}
+	defer rows.Close()
+
+	var invocations []ClaudeInvocation
+	for rows.Next() {
+		var inv ClaudeInvocation
+		if err := rows.Scan(&inv.ID, &inv.RunID, &inv.Stage, &inv.SessionID, &inv.Model, &inv.Effort,
+			&inv.Prompt, &inv.Output, &inv.Stderr, &inv.Subtype, &inv.IsError,
+			&inv.InputTokens, &inv.OutputTokens, &inv.CostUSD, &inv.StartedAt, &inv.FinishedAt); err != nil {
+			return nil, fmt.Errorf("scan claude invocation row: %w", err)
+		}
+		invocations = append(invocations, inv)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claude invocation rows: %w", err)
+	}
+	return invocations, nil
+}
+
+// ListInvocationsSince возвращает вызовы claude по всем прогонам начиная с
+// since, в хронологическом порядке — плоский "лог сессий" для дашборда
+// (см. GET /api/invocations), в отличие от ListInvocations (один прогон).
+func (s *Store) ListInvocationsSince(ctx context.Context, since time.Time) ([]ClaudeInvocation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, stage, session_id, model, effort, prompt, output, stderr, subtype, is_error,
+		       input_tokens, output_tokens, cost_usd, started_at, finished_at
+		FROM claude_invocations WHERE started_at >= ? ORDER BY id ASC
+	`, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list claude invocations since %s: %w", since, err)
 	}
 	defer rows.Close()
 

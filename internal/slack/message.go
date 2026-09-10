@@ -127,6 +127,25 @@ func BuildPausedMessage(taskName, taskURL string, pauseFor time.Duration, reason
 	return text, blocks
 }
 
+// BuildManualPauseMessage формирует сообщение о том, что прогон остановлен
+// по запросу оператора через веб-интерфейс (см. Queue.pauseManually) — в
+// отличие от BuildPausedMessage, не автоматический повтор через сверку,
+// а ожидание явного «продолжить».
+func BuildManualPauseMessage(taskName, taskURL string) (text string, blocks []Block) {
+	text = fmt.Sprintf("⏸️ Проверка остановлена оператором: %s — %s", taskName, taskURL)
+
+	lines := fmt.Sprintf(
+		"*Задача:* <%s|%s>\n*Повтор:* вручную, кнопкой «продолжить» в веб-интерфейсе",
+		taskURL, taskName,
+	)
+
+	blocks = []Block{
+		Header("⏸️ Ревью остановлено оператором"),
+		Section(lines),
+	}
+	return text, blocks
+}
+
 func verdictPresentation(verdict string) (emoji, label string) {
 	switch verdict {
 	case "pass":

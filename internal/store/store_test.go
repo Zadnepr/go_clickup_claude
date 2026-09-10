@@ -44,7 +44,7 @@ func TestTryEnqueue_Deduplicates(t *testing.T) {
 	}
 }
 
-func TestTryEnqueue_BlockedWhileRunningOrDone(t *testing.T) {
+func TestTryEnqueue_BlockedWhileRunning(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
@@ -59,12 +59,34 @@ func TestTryEnqueue_BlockedWhileRunningOrDone(t *testing.T) {
 	if _, ok, err := s.TryEnqueue(ctx, "task-2"); err != nil || ok {
 		t.Fatalf("expected enqueue blocked while running: ok=%v err=%v", ok, err)
 	}
+}
 
-	if err := s.MarkDone(ctx, id, "pass", "session-1", Usage{}); err != nil {
+// TestTryEnqueue_AllowsReenqueueAfterDone проверяет ключевое свойство:
+// задача, уже доведённая до done, не заблокирована навсегда. Тег-триггер
+// снимается только на успешном decide (см. Queue.runReview) — то есть уже к
+// моменту done тега на задаче нет, и она не может совпасть условием
+// триггера сама по себе. Если тег/статус снова совпали — это осознанный
+// повторный запрос (человек перетегировал задачу руками после доработки),
+// и сверка обязана его подхватить, а не отбросить молча из-за старой
+// дедуп-записи.
+func TestTryEnqueue_AllowsReenqueueAfterDone(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	id, ok, err := s.TryEnqueue(ctx, "task-2")
+	if err != nil || !ok {
+		t.Fatalf("initial enqueue failed: ok=%v err=%v", ok, err)
+	}
+	if err := s.MarkDone(ctx, id, "fail", "session-1", Usage{}); err != nil {
 		t.Fatalf("MarkDone error: %v", err)
 	}
-	if _, ok, err := s.TryEnqueue(ctx, "task-2"); err != nil || ok {
-		t.Fatalf("expected enqueue blocked while done: ok=%v err=%v", ok, err)
+
+	newID, ok, err := s.TryEnqueue(ctx, "task-2")
+	if err != nil || !ok {
+		t.Fatalf("expected a fresh enqueue to be allowed after done: ok=%v err=%v", ok, err)
+	}
+	if newID == id {
+		t.Errorf("expected a new run id distinct from the done run, got the same id %d", id)
 	}
 }
 
@@ -551,6 +573,37 @@ func TestListInvocations_OrderedChronologically(t *testing.T) {
 	}
 	if len(invocations) != 2 || invocations[0].Stage != "spec" || invocations[1].Stage != "review" {
 		t.Fatalf("expected [spec review] in order, got: %+v", invocations)
+	}
+}
+
+func TestListInvocationsSince_ExcludesOlderInvocations(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	runA, _, err := s.TryEnqueue(ctx, "task-old")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if _, err := s.RecordInvocation(ctx, ClaudeInvocation{RunID: runA, Stage: "spec", StartedAt: old, FinishedAt: old}); err != nil {
+		t.Fatalf("RecordInvocation error: %v", err)
+	}
+
+	runB, _, err := s.TryEnqueue(ctx, "task-new")
+	if err != nil {
+		t.Fatalf("TryEnqueue error: %v", err)
+	}
+	recent := time.Now()
+	if _, err := s.RecordInvocation(ctx, ClaudeInvocation{RunID: runB, Stage: "spec", StartedAt: recent, FinishedAt: recent}); err != nil {
+		t.Fatalf("RecordInvocation error: %v", err)
+	}
+
+	invocations, err := s.ListInvocationsSince(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ListInvocationsSince error: %v", err)
+	}
+	if len(invocations) != 1 || invocations[0].RunID != runB {
+		t.Fatalf("expected only the recent invocation, got: %+v", invocations)
 	}
 }
 

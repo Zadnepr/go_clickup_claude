@@ -147,6 +147,8 @@ func (q *Queue) processTask(taskID string) {
 		return
 	}
 
+	q.registerActive(taskID, runID, cancel)
+	defer q.unregisterActive(taskID)
 	q.runReview(ctx, log, task, runID)
 }
 
@@ -188,6 +190,8 @@ func (q *Queue) resumeTask(taskID string) {
 	}
 
 	log.Info("resuming review interrupted by a previous instance")
+	q.registerActive(taskID, runID, cancel)
+	defer q.unregisterActive(taskID)
 	q.runReview(ctx, log, task, runID)
 }
 
@@ -256,6 +260,10 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		return
 	}
 
+	if q.checkManualPause(log, task, runID, "", review.TokenUsage{}) {
+		return
+	}
+
 	spec, _, specErr := stageRun(ctx, q, log, runID, stageSpec, func() (specStageData, error) {
 		sr, err := q.deps.Runner.RunSpec(ctx, task.URL, func(u review.TokenUsage) {
 			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(u))
@@ -279,7 +287,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		return specStageData{SessionID: sr.SessionID, SpecID: specID, Content: content, Usage: sr.Usage}, nil
 	})
 	if errors.Is(specErr, review.ErrUsageLimit) {
-		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, spec.SessionID, specErr, spec.Usage)
+		q.pauseAndRestore(log, task, runID, originalAssignees, spec.SessionID, specErr, spec.Usage)
 		return
 	}
 	if specErr != nil {
@@ -295,6 +303,10 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	// записан предыдущим (см. ensureSpecFile).
 	specPath := q.ensureSpecFile(log, spec)
 
+	if q.checkManualPause(log, task, runID, spec.SessionID, spec.Usage) {
+		return
+	}
+
 	reviewData, _, reviewErr := stageRun(ctx, q, log, runID, stageReview, func() (reviewStageData, error) {
 		result, err := q.deps.Runner.RunReview(ctx, task.URL, specPath, func(u review.TokenUsage) {
 			q.deps.Store.UpdateRunningUsage(ctx, runID, storeUsage(spec.Usage.Add(u)))
@@ -308,7 +320,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	})
 	totalUsage := spec.Usage.Add(reviewData.Usage)
 	if errors.Is(reviewErr, review.ErrUsageLimit) {
-		q.pauseAndRestore(ctx, log, task, runID, originalAssignees, reviewData.SessionID, reviewErr, totalUsage)
+		q.pauseAndRestore(log, task, runID, originalAssignees, reviewData.SessionID, reviewErr, totalUsage)
 		return
 	}
 
@@ -383,7 +395,9 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		return
 	}
 
-	if err := q.deps.Store.MarkDone(ctx, runID, verdict.Status, reviewData.SessionID, storeUsage(totalUsage)); err != nil {
+	fctx, cancel := finalizeCtx()
+	defer cancel()
+	if err := q.deps.Store.MarkDone(fctx, runID, verdict.Status, reviewData.SessionID, storeUsage(totalUsage)); err != nil {
 		log.Error("failed to mark run done", "error", err.Error())
 	}
 }
@@ -394,23 +408,31 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 // перед reviewErr == nil в runReview), карточку возвращаем в исходный вид —
 // статус триггера и снятых исполнителей — чтобы сверка подобрала задачу
 // заново сама, без ручного вмешательства, когда лимит освободится.
-func (q *Queue) pauseAndRestore(ctx context.Context, log *slog.Logger, task *clickup.Task, runID int64, originalAssignees []int, sessionID string, causeErr error, usage review.TokenUsage) {
+func (q *Queue) pauseAndRestore(log *slog.Logger, task *clickup.Task, runID int64, originalAssignees []int, sessionID string, causeErr error, usage review.TokenUsage) {
 	cfg := q.deps.Cfg
 	errMsg := causeErr.Error()
 
+	// Дальше — исключительно завершающие действия ("вернуть карточку и
+	// зафиксировать паузу"), не зависящие от ctx самого прогона (см.
+	// finalizeCtx): usage limit обычно не связан с истечением ReviewTimeout,
+	// но если оба всё же совпали по времени, откат карточки и запись паузы
+	// не должны провалиться вместе с исходным ctx.
+	fctx, cancel := finalizeCtx()
+	defer cancel()
+
 	if cfg.StatusTrigger != "" {
-		if err := q.deps.ClickUp.SetStatus(ctx, task.ID, cfg.StatusTrigger); err != nil {
+		if err := q.deps.ClickUp.SetStatus(fctx, task.ID, cfg.StatusTrigger); err != nil {
 			log.Error("failed to move task back to trigger status after usage limit pause",
 				"attempted_status", cfg.StatusTrigger, "error", err.Error())
 		}
 	}
 	if len(originalAssignees) > 0 {
-		if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, originalAssignees); err != nil {
+		if err := q.deps.ClickUp.AddAssignees(fctx, task.ID, originalAssignees); err != nil {
 			log.Error("failed to restore assignees after usage limit pause", "assignees", originalAssignees, "error", err.Error())
 		}
 	}
 
-	if err := q.deps.Store.MarkPaused(ctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
+	if err := q.deps.Store.MarkPaused(fctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
 		log.Error("failed to mark run paused", "error", err.Error())
 	}
 
@@ -420,15 +442,68 @@ func (q *Queue) pauseAndRestore(ctx context.Context, log *slog.Logger, task *cli
 		"pause_for", cfg.UsageLimitPause, "error", errMsg)
 
 	text, blocks := slack.BuildPausedMessage(task.Name, task.URL, cfg.UsageLimitPause, errMsg)
-	if err := q.deps.Slack.Send(ctx, text, blocks); err != nil {
+	if err := q.deps.Slack.Send(fctx, text, blocks); err != nil {
 		log.Error("failed to send slack paused notification", "error", err.Error())
 	}
 }
 
+// checkManualPause проверяет, не попросили ли остановить именно эту задачу
+// через RequestPause (см. control.go и "поставить на паузу" в
+// веб-интерфейсе), и если да — останавливает прогон на этой границе этапов
+// (см. pauseManually). true означает, что runReview должен завершиться
+// прямо сейчас, не запуская следующий этап.
+func (q *Queue) checkManualPause(log *slog.Logger, task *clickup.Task, runID int64, sessionID string, usage review.TokenUsage) bool {
+	if !q.consumePauseRequest(task.ID) {
+		return false
+	}
+	q.pauseManually(log, task, runID, sessionID, usage)
+	return true
+}
+
+// pauseManually останавливает прогон по запросу оператора. В отличие от
+// pauseAndRestore (пауза из-за исчерпанного лимита claude — временное
+// состояние аккаунта, а не запроса) — не трогает статус/исполнителей
+// карточки и не ставит на паузу всю очередь, только этот конкретный
+// прогон. Карточка намеренно остаётся как есть (не в STATUS_TRIGGER): её
+// возврат туда означал бы, что обычная сверка попробует запустить всё
+// заново раньше, чем оператор явно нажмёт «продолжить» — см. httpapi'шный
+// эндпоинт resume → Queue.SubmitResume → Store.ReopenOrEnqueue находит
+// этот же run_id по task_id и доводит прогон до конца, используя уже
+// пройденные этапы.
+func (q *Queue) pauseManually(log *slog.Logger, task *clickup.Task, runID int64, sessionID string, usage review.TokenUsage) {
+	fctx, cancel := finalizeCtx()
+	defer cancel()
+
+	const reason = "остановлено оператором через веб-интерфейс"
+	if err := q.deps.Store.MarkPaused(fctx, runID, sessionID, reason, storeUsage(usage)); err != nil {
+		log.Error("failed to mark run paused", "error", err.Error())
+	}
+	log.Info("run paused by operator request, waiting for an explicit resume")
+
+	text, blocks := slack.BuildManualPauseMessage(task.Name, task.URL)
+	if err := q.deps.Slack.Send(fctx, text, blocks); err != nil {
+		log.Error("failed to send slack manual-pause notification", "error", err.Error())
+	}
+}
+
+// markFailed помечает прогон проваленным. ctx прогона не используется для
+// самой записи (см. finalizeCtx) — если он уже отменён (истёк ReviewTimeout
+// или сработал RequestCancel, см. control.go), запись итогового статуса не
+// должна проваливаться вместе с ним: иначе прогон навсегда зависнет в
+// статусе running, и исправить это сможет только ручное вмешательство в БД.
 func (q *Queue) markFailed(ctx context.Context, log *slog.Logger, runID int64, sessionID, errMsg string, usage review.TokenUsage) {
-	if err := q.deps.Store.MarkFailed(ctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
+	fctx, cancel := finalizeCtx()
+	defer cancel()
+	if err := q.deps.Store.MarkFailed(fctx, runID, sessionID, errMsg, storeUsage(usage)); err != nil {
 		log.Error("failed to mark run failed", "error", err.Error())
 	}
+}
+
+// finalizeCtx — независимый от ctx прогона контекст для завершающей записи
+// результата (MarkDone/MarkFailed/MarkPaused, см. markFailed/pauseAndRestore/
+// pauseManually и финальный MarkDone в runReview).
+func finalizeCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
 }
 
 func storeUsage(u review.TokenUsage) store.Usage {

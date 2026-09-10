@@ -124,6 +124,53 @@ func TestGetTask_NoDeveloperCustomField(t *testing.T) {
 	}
 }
 
+func TestGetTeamMembers(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/team" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"teams": []map[string]any{
+				{
+					"id": "team1",
+					"members": []map[string]any{
+						{"user": map[string]any{
+							"id": 81838079, "username": "Andrey Zadneprianiy",
+							"email": "zadnepr@perfectpanel.com", "color": "#827718",
+							"profilePicture": "https://attachments.clickup.com/profilePictures/81838079.jpg",
+						}},
+					},
+				},
+				{"id": "other-team", "members": []map[string]any{}},
+			},
+		})
+	})
+
+	members, err := c.GetTeamMembers(context.Background())
+	if err != nil {
+		t.Fatalf("GetTeamMembers error: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("expected 1 member, got %d", len(members))
+	}
+	if members[0].ID != 81838079 || members[0].Username != "Andrey Zadneprianiy" {
+		t.Errorf("unexpected member: %+v", members[0])
+	}
+	if members[0].Avatar == "" {
+		t.Error("expected avatar URL to be populated")
+	}
+}
+
+func TestGetTeamMembers_TeamNotFound(t *testing.T) {
+	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"teams": []map[string]any{{"id": "other-team"}}})
+	})
+
+	if _, err := c.GetTeamMembers(context.Background()); err == nil {
+		t.Fatal("expected an error when the configured team is not in the response")
+	}
+}
+
 func TestSetStatus_Success(t *testing.T) {
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut || r.URL.Path != "/task/123" {

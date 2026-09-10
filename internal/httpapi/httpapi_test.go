@@ -16,11 +16,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zadnepr/go_clickup_claude/internal/queue"
 	"github.com/Zadnepr/go_clickup_claude/internal/store"
 )
 
+// fakeSubmitter — фейковая реализация QueueControl. По умолчанию (нулевые
+// значения полей) ведёт себя как пустая очередь: ничего не активно, ничего
+// не в буфере, любое ручное действие над задачей "не найдено".
 type fakeSubmitter struct {
-	submitted []string
+	submitted    []string
+	active       []queue.ActiveRunInfo
+	pending      []string
+	cancelResult bool
+	pauseResult  bool
+	resumeResult bool
+	cancelledID  string
+	pausedID     string
+	resumedID    string
 }
 
 func (f *fakeSubmitter) Submit(taskID string) bool {
@@ -28,12 +40,34 @@ func (f *fakeSubmitter) Submit(taskID string) bool {
 	return true
 }
 
+func (f *fakeSubmitter) ActiveRuns() []queue.ActiveRunInfo { return f.active }
+func (f *fakeSubmitter) Pending() []string                 { return f.pending }
+
+func (f *fakeSubmitter) RequestCancel(taskID string) bool {
+	f.cancelledID = taskID
+	return f.cancelResult
+}
+
+func (f *fakeSubmitter) RequestPause(taskID string) bool {
+	f.pausedID = taskID
+	return f.pauseResult
+}
+
+func (f *fakeSubmitter) SubmitResume(taskID string) bool {
+	f.resumedID = taskID
+	return f.resumeResult
+}
+
 type fakePinger struct {
-	err        error
-	active     []store.Run
-	stats      store.Stats
-	statsErr   error
-	statsSince time.Time
+	err         error
+	active      []store.Run
+	stats       store.Stats
+	statsErr    error
+	statsSince  time.Time
+	run         *store.Run
+	runErr      error
+	stages      []store.RunStage
+	invocations []store.ClaudeInvocation
 }
 
 func (f *fakePinger) Ping(ctx context.Context) error { return f.err }
@@ -48,6 +82,22 @@ func (f *fakePinger) Stats(ctx context.Context, since time.Time) (store.Stats, e
 		return store.Stats{}, f.statsErr
 	}
 	return f.stats, nil
+}
+
+func (f *fakePinger) GetRun(ctx context.Context, runID int64) (*store.Run, error) {
+	return f.run, f.runErr
+}
+
+func (f *fakePinger) ListStages(ctx context.Context, runID int64) ([]store.RunStage, error) {
+	return f.stages, nil
+}
+
+func (f *fakePinger) ListInvocations(ctx context.Context, runID int64) ([]store.ClaudeInvocation, error) {
+	return f.invocations, nil
+}
+
+func (f *fakePinger) ListInvocationsSince(ctx context.Context, since time.Time) ([]store.ClaudeInvocation, error) {
+	return f.invocations, nil
 }
 
 type fakeManualRunner struct {

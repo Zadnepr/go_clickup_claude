@@ -85,6 +85,7 @@ type fakeRunner struct {
 	gotSpecPath  string // specPath, с которым реально вызвали RunReview
 	reviewCalled bool   // была ли вызвана RunReview (нужно проверять, что её пропустили)
 	specCalled   bool   // была ли вызвана RunSpec (нужно проверять, что её пропустили при возобновлении)
+	afterSpec    func() // если задано, вызывается в конце RunSpec — используется, чтобы смоделировать RequestPause/RequestCancel "между этапами" в тестах
 
 	specDirOnce sync.Once
 	specDir     string
@@ -94,12 +95,24 @@ func (f *fakeRunner) GitFetch(ctx context.Context) error { return f.gitErr }
 
 func (f *fakeRunner) RunSpec(ctx context.Context, taskURL string, onUsage func(review.TokenUsage)) (review.SpecResult, error) {
 	f.specCalled = true
+	if f.afterSpec != nil {
+		f.afterSpec()
+	}
+	// Как и настоящий Runner (exec.CommandContext убивает подпроцесс claude
+	// при отмене ctx, что возвращается как ошибка) — если ctx уже отменён
+	// (см. Queue.RequestCancel), вызов должен считаться неуспешным.
+	if err := ctx.Err(); err != nil {
+		return review.SpecResult{}, err
+	}
 	return review.SpecResult{SessionID: "spec-session", Content: f.specContent, Usage: f.specUsage}, f.specErr
 }
 
 func (f *fakeRunner) RunReview(ctx context.Context, taskURL, specPath string, onUsage func(review.TokenUsage)) (review.Result, error) {
 	f.reviewCalled = true
 	f.gotSpecPath = specPath
+	if err := ctx.Err(); err != nil {
+		return review.Result{}, err
+	}
 	return f.result, f.reviewErr
 }
 
@@ -430,10 +443,43 @@ func TestProcessTask_NotEligible_SkipsWithoutDedupRecord(t *testing.T) {
 	}
 }
 
-func TestProcessTask_DuplicateEvent_DoesNotProduceSecondRun(t *testing.T) {
+func TestProcessTask_SkipsWhileAlreadyRunning(t *testing.T) {
+	// Настоящая защита от дубликата события (два вебхука на одно и то же
+	// изменение почти одновременно) — active-статус (queued/running) уже
+	// занятого прогона, а не сам факт, что задача когда-либо проверялась
+	// (см. TestProcessTask_ReprocessesAfterPreviousRunDone).
+	task := &clickup.Task{ID: "5", Name: "Task 5", URL: "https://app.clickup.com/t/5", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	runID := mustEnqueue(t, deps, "5")
+	if err := deps.Store.MarkRunning(context.Background(), runID); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
+
+	q := New(deps, 10)
+	q.processTask("5")
+
+	if len(*calls) != 0 {
+		t.Fatalf("expected no processing while a run for this task is already active, got %d slack calls", len(*calls))
+	}
+	if runner.reviewCalled {
+		t.Error("expected RunReview not to be called for an already-running task")
+	}
+}
+
+func TestProcessTask_ReprocessesAfterPreviousRunDone(t *testing.T) {
+	// Тег-триггер снимается только при успешном decide — то есть done
+	// означает, что тег уже был снят. Если тег/статус на задаче снова
+	// совпали с условием (в тесте — статический fakeClickUp, что
+	// эквивалентно человеку, перетегировавшему задачу заново), это
+	// осознанный повторный запрос, а не эхо старого события: done не
+	// должен блокировать постановку навсегда (см. Store.TryEnqueue).
 	task := &clickup.Task{ID: "5", Name: "Task 5", URL: "https://app.clickup.com/t/5", ListID: "list1", Tags: []string{"ai"}, Status: "to check"}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
+		specContent: "spec content",
 		result: review.Result{
 			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
 			Verdict: review.Verdict{Status: review.StatusPass},
@@ -444,10 +490,10 @@ func TestProcessTask_DuplicateEvent_DoesNotProduceSecondRun(t *testing.T) {
 	q := New(deps, 10)
 
 	q.processTask("5")
-	q.processTask("5") // повторное событие по той же задаче
+	q.processTask("5") // тег/статус выставлены заново после первой проверки
 
-	if len(*calls) != 2 {
-		t.Fatalf("expected exactly 2 slack notifications (started + finished) despite duplicate event, got %d", len(*calls))
+	if len(*calls) != 4 {
+		t.Fatalf("expected 2 full runs worth of notifications (started+finished twice), got %d", len(*calls))
 	}
 }
 
@@ -648,19 +694,26 @@ func TestResumeTask_BypassesEligibility(t *testing.T) {
 	}
 }
 
-func TestResumeTask_AlreadyDone_SkipsWithoutReprocessing(t *testing.T) {
+func TestResumeTask_AlreadyRunning_SkipsWithoutReprocessing(t *testing.T) {
+	// SubmitResume/resumeTask вызывается только для задач, найденных
+	// Store.RecoverFromRestart (застряли в running) — здесь моделируется
+	// именно занятое активное состояние, а не устаревшее предположение
+	// «done блокирует постановку навсегда» (см. TryEnqueue).
 	task := &clickup.Task{ID: "12", Name: "Task 12", URL: "https://app.clickup.com/t/12", ListID: "list1"}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{}
 
 	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
-	deps.Store.MarkDone(context.Background(), mustEnqueue(t, deps, "12"), "pass", "s", store.Usage{})
+	runID := mustEnqueue(t, deps, "12")
+	if err := deps.Store.MarkRunning(context.Background(), runID); err != nil {
+		t.Fatalf("MarkRunning error: %v", err)
+	}
 
 	q := New(deps, 10)
 	q.resumeTask("12")
 
 	if len(*calls) != 0 {
-		t.Fatalf("expected no reprocessing for a task that already has a done run, got %d slack calls", len(*calls))
+		t.Fatalf("expected no reprocessing for a task that is already actively running, got %d slack calls", len(*calls))
 	}
 }
 
@@ -771,6 +824,88 @@ func TestResumeTask_ReusesCompletedReviewStage_DoesNotRepostComment(t *testing.T
 	}
 	if len(*calls) == 0 {
 		t.Error("expected a slack notification for the finished review")
+	}
+}
+
+func TestProcessTask_ManualPause_StopsBeforeReviewAndCanBeResumed(t *testing.T) {
+	task := &clickup.Task{
+		ID: "30", Name: "Task 30", URL: "https://app.clickup.com/t/30",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		specContent: "spec content",
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	// Имитирует оператора, нажавшего "поставить на паузу" через веб-интерфейс
+	// прямо во время выполнения /spec — RequestPause должен остановить
+	// прогон на границе перед /review, не вызывая его вовсе.
+	runner.afterSpec = func() { q.RequestPause("30") }
+
+	q.processTask("30")
+
+	if runner.reviewCalled {
+		t.Fatal("expected RunReview not to be called once a pause was requested before it")
+	}
+	run, err := deps.Store.GetRun(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != store.StatusPaused {
+		t.Fatalf("expected the run to be paused, got status %q", run.Status)
+	}
+
+	// "Продолжить": SubmitResume должен переоткрыть тот же прогон и
+	// довести его до конца — на этот раз включая /review.
+	q.resumeTask("30")
+
+	if !runner.reviewCalled {
+		t.Fatal("expected RunReview to run after an explicit resume")
+	}
+	run, err = deps.Store.GetRun(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != store.StatusDone || run.Verdict != "pass" {
+		t.Errorf("expected the resumed run to finish done/pass, got: %+v", run)
+	}
+}
+
+func TestProcessTask_ManualCancel_StopsRunAndMarksFailed(t *testing.T) {
+	task := &clickup.Task{
+		ID: "31", Name: "Task 31", URL: "https://app.clickup.com/t/31",
+		ListID: "list1", Tags: []string{"ai"}, Status: "to check",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{specContent: "spec content"}
+
+	deps, _, _ := newTestDeps(t, cu, runner, testConfig(t))
+	q := New(deps, 10)
+	// Имитирует оператора, нажавшего "прервать" во время /spec — в отличие
+	// от паузы, это должно оборвать контекст прогона немедленно.
+	runner.afterSpec = func() {
+		if !q.RequestCancel("31") {
+			t.Error("expected RequestCancel to find the active task")
+		}
+	}
+
+	q.processTask("31")
+
+	run, err := deps.Store.GetRun(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("GetRun error: %v", err)
+	}
+	if run.Status != store.StatusFailed {
+		t.Fatalf("expected the run to be marked failed after cancellation, got status %q", run.Status)
+	}
+	if len(q.ActiveRuns()) != 0 {
+		t.Error("expected no active runs left registered after the run finished")
 	}
 }
 

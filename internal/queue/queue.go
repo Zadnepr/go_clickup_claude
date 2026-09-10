@@ -29,6 +29,16 @@ type Queue struct {
 	pauseMu     sync.Mutex
 	pausedUntil time.Time
 	pauseReason string
+
+	// activeMu/active — задачи, обрабатываемые прямо сейчас (см. control.go:
+	// RequestCancel/RequestPause/ActiveRuns).
+	activeMu sync.Mutex
+	active   map[string]*activeRun
+
+	// pendingMu/pending — задачи, лежащие в буфере ch, но ещё не взятые ни
+	// одним воркером (см. control.go: Pending).
+	pendingMu sync.Mutex
+	pending   []string
 }
 
 // New создаёт очередь с заданным размером буфера.
@@ -46,6 +56,7 @@ func New(deps Deps, bufferSize int) *Queue {
 func (q *Queue) Submit(taskID string) bool {
 	select {
 	case q.ch <- queueItem{taskID: taskID}:
+		q.addPending(taskID)
 		return true
 	default:
 		q.deps.Logger.Warn("queue buffer is full, dropping event; reconcile will pick it up later", "task_id", taskID)
@@ -62,6 +73,7 @@ func (q *Queue) Submit(taskID string) bool {
 func (q *Queue) SubmitResume(taskID string) bool {
 	select {
 	case q.ch <- queueItem{taskID: taskID, resume: true}:
+		q.addPending(taskID)
 		return true
 	default:
 		q.deps.Logger.Warn("queue buffer is full, dropping resumed task; it will stay stuck until manually retried",
@@ -106,6 +118,7 @@ func (q *Queue) Start(workers int) {
 		go func() {
 			defer q.wg.Done()
 			for item := range q.ch {
+				q.removePending(item.taskID)
 				if item.resume {
 					q.resumeTask(item.taskID)
 				} else {

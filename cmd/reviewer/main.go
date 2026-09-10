@@ -128,6 +128,8 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		Trigger:       &manualRunner{cfg: cfg, cuClient: cuClient, queue: q, logger: logger},
 		WebhookSecret: cfg.CUWebhookSecret,
 		Store:         st,
+		ClickUp:       cuClient,
+		Cfg:           cfg,
 		RepoPath:      cfg.RepoPath,
 		ClaudeBinary:  "claude",
 		Logger:        logger,
@@ -148,7 +150,10 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	stopReconcile := make(chan struct{})
 	if cfg.ReconcileInterval > 0 {
+		logger.Info("reconcile loop starting", "interval", cfg.ReconcileInterval.String())
 		go runReconcileLoop(cfg, cuClient, q, logger, stopReconcile)
+	} else {
+		logger.Warn("reconcile loop disabled (RECONCILE_INTERVAL <= 0)")
 	}
 
 	// Обычный signal.Notify, а не NotifyContext: NotifyContext перехватывает
@@ -187,6 +192,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 // всё, что ещё не обрабатывалось. Закрывает класс проблем с потерянными
 // вебхуками.
 func runReconcileLoop(cfg *config.Config, cuClient *clickup.Client, q *queue.Queue, logger *slog.Logger, stop <-chan struct{}) {
+	logger.Info("reconcile loop entered")
 	ticker := time.NewTicker(cfg.ReconcileInterval)
 	defer ticker.Stop()
 
@@ -203,6 +209,7 @@ func runReconcileLoop(cfg *config.Config, cuClient *clickup.Client, q *queue.Que
 }
 
 func reconcileOnce(cfg *config.Config, cuClient *clickup.Client, q *queue.Queue, logger *slog.Logger) {
+	logger.Info("reconcile: scan started")
 	if _, err := scanAndSubmit(context.Background(), cfg, cuClient, q); err != nil {
 		logger.Error("reconcile: failed to list tasks", "error", err.Error())
 		return
