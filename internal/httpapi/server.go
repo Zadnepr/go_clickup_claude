@@ -30,13 +30,16 @@ type Submitter interface {
 }
 
 // QueueControl — то, что нужно ручному управлению из дашборда: текущая
-// задача (прервать/поставить на паузу/продолжить) и список задач в буфере
-// очереди. Встраивает Submitter — набор целиком реализует одна и та же
+// задача (прервать/поставить на паузу/продолжить). Список задач в очереди
+// (GET /api/queue: "pending") дашборд опрашивает напрямую у ClickUp (см.
+// ClickUpReader.ListTasksByTagAndStatus, newQueueHandler) — Queue.Pending()
+// отражал бы только внутренний буфер этого процесса: пуст сразу после
+// рестарта и склонен копить дубли одного и того же task_id, поэтому здесь
+// не нужен. Встраивает Submitter — набор целиком реализует одна и та же
 // *queue.Queue.
 type QueueControl interface {
 	Submitter
 	ActiveRuns() []queue.ActiveRunInfo
-	Pending() []string
 	RequestCancel(taskID string) bool
 	RequestPause(taskID string) bool
 	SubmitResume(taskID string) bool
@@ -57,12 +60,14 @@ type DataStore interface {
 }
 
 // ClickUpReader — то немногое от ClickUp API, что нужно дашборду для
-// отображения текущей задачи, разрешения ID исполнителей в имя/аватар и
-// списка остальных задач в колонке-триггере без нужного тега.
+// отображения текущей задачи, разрешения ID исполнителей в имя/аватар,
+// списка задач в очереди (с тегом-триггером) и списка остальных задач в
+// колонке-триггере без нужного тега.
 type ClickUpReader interface {
 	GetTask(ctx context.Context, taskID string) (*clickup.Task, error)
 	GetTeamMembers(ctx context.Context) ([]clickup.Member, error)
 	ListTasksByStatus(ctx context.Context, listID, status string) ([]clickup.Task, error)
+	ListTasksByTagAndStatus(ctx context.Context, listID, tag, status string) ([]clickup.Task, error)
 }
 
 // RunnerControl — то, что нужно веб-интерфейсу, чтобы менять модель/effort

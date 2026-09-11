@@ -261,6 +261,29 @@ func TestProcessTask_PassVerdict_FullPipeline(t *testing.T) {
 	if len(*calls) != 2 {
 		t.Fatalf("expected 2 slack notifications (started + finished), got %d", len(*calls))
 	}
+
+	stats, err := deps.Store.Stats(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Stats error: %v", err)
+	}
+	var run *store.Run
+	for i := range stats.Runs {
+		if stats.Runs[i].TaskID == "1" {
+			run = &stats.Runs[i]
+		}
+	}
+	if run == nil {
+		t.Fatal("expected to find the run for task 1 in stats")
+	}
+	if run.TaskName != "Task 1" {
+		t.Errorf("expected TaskName %q to be recorded on the run, got %q", "Task 1", run.TaskName)
+	}
+	// Второе сообщение (calls[1]) — итог ревью (calls[0] — «проверка начата»),
+	// см. notifyReviewResult: тот же текст должен осесть на прогоне, чтобы
+	// дашборд мог показать его без повторной отправки в Slack.
+	if run.SlackMessage == "" || run.SlackMessage != (*calls)[1].Text {
+		t.Errorf("expected SlackMessage on the run to match the sent notification text, got %q vs sent %q", run.SlackMessage, (*calls)[1].Text)
+	}
 }
 
 func TestProcessTask_FailVerdict_AssignsConfiguredUser(t *testing.T) {
@@ -589,8 +612,13 @@ func TestProcessTask_RemovesAssigneesBeforeCheck(t *testing.T) {
 
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
-	if len(cu.removedAssignees) != 1 || len(cu.removedAssignees[0]) != 2 {
-		t.Fatalf("expected original assignees [7 8] to be removed before the check, got: %+v", cu.removedAssignees)
+	// Дважды: один раз в setup (снятие исходных исполнителей на время
+	// проверки), второй — в decide (fakeClickUp.GetTask отдаёт статичную
+	// копию task.Assignees, поэтому с точки зрения decide они всё ещё
+	// "текущие"; см. TestStaleAssignees для содержательной проверки самой
+	// логики выбора, кого снимать).
+	if len(cu.removedAssignees) != 2 || len(cu.removedAssignees[0]) != 2 || len(cu.removedAssignees[1]) != 2 {
+		t.Fatalf("expected original assignees [7 8] to be removed before the check and again in decide, got: %+v", cu.removedAssignees)
 	}
 }
 
@@ -1038,10 +1066,16 @@ func mustEnqueue(t *testing.T, deps Deps, taskID string) int64 {
 	return id
 }
 
-func TestQueue_SubmitResume_BypassesEligibilityThroughRealDispatch(t *testing.T) {
+func TestQueue_SubmitResume_BypassesListButStillNeedsTagAndStatus(t *testing.T) {
+	// SubmitResume не проверяет принадлежность списку (в отличие от
+	// processTask) — прогон уже был начат для этой задачи и продолжается
+	// независимо от ListID. Статус "checking" (STATUS_RUNNING), а не
+	// "to check" (STATUS_TRIGGER), тоже должен быть достаточен для
+	// возобновления — именно в эту колонку setup переводит карточку перед
+	// проверкой (см. resumable).
 	task := &clickup.Task{
 		ID: "13", Name: "Task 13", URL: "https://app.clickup.com/t/13",
-		ListID: "list1", Tags: []string{"other"}, Status: "checking", // не проходит isEligible
+		ListID: "other-list", Tags: []string{"ai"}, Status: "checking",
 	}
 	cu := &fakeClickUp{task: task}
 	runner := &fakeRunner{
@@ -1069,6 +1103,57 @@ func TestQueue_SubmitResume_BypassesEligibilityThroughRealDispatch(t *testing.T)
 	}
 
 	q.Shutdown(time.Second)
+}
+
+func TestQueue_SubmitResume_AbandonsWhenTaskWasHandledManually(t *testing.T) {
+	// Пока сервис был недоступен, задачу могли обработать вручную — тег
+	// сняли или статус сменили не на STATUS_RUNNING/STATUS_TRIGGER. Такой
+	// прогон не должен доходить до /spec-go и /review-go: его результат уже
+	// никому не нужен, а вердикт был бы наложен поверх ручной обработки.
+	task := &clickup.Task{
+		ID: "23", Name: "Task 23", URL: "https://app.clickup.com/t/23",
+		ListID: "list1", Tags: []string{"other"}, Status: "in progress",
+	}
+	cu := &fakeClickUp{task: task}
+	runner := &fakeRunner{
+		result: review.Result{
+			Output:  "ok\nИТОГ: критичных=0 важных=0 минор=0 статус=pass",
+			Verdict: review.Verdict{Status: review.StatusPass},
+		},
+	}
+
+	deps, _, calls := newTestDeps(t, cu, runner, testConfig(t))
+	st := deps.Store
+	runID, _, err := st.ReopenOrEnqueue(context.Background(), "23")
+	if err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if err := st.MarkRunning(context.Background(), runID); err != nil {
+		t.Fatalf("seed running run: %v", err)
+	}
+	if _, err := st.RecoverFromRestart(context.Background()); err != nil {
+		t.Fatalf("seed interrupted run: %v", err)
+	}
+
+	q := New(deps, 10)
+	q.Start(1)
+	q.SubmitResume("23")
+	q.Shutdown(time.Second)
+
+	if len(*calls) != 0 {
+		t.Errorf("expected no Slack notifications for an abandoned resume, got %d", len(*calls))
+	}
+	if runner.specCalled || runner.reviewCalled {
+		t.Errorf("expected claude not to be invoked for an abandoned resume, got specCalled=%v reviewCalled=%v", runner.specCalled, runner.reviewCalled)
+	}
+
+	run, err := st.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != store.StatusFailed {
+		t.Errorf("expected run status %q, got %q (error: %q)", store.StatusFailed, run.Status, run.Error)
+	}
 }
 
 func TestStripVerdictLine(t *testing.T) {

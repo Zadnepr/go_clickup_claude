@@ -246,7 +246,7 @@ func TestMarkDone_StoresTokenUsage(t *testing.T) {
 	}
 }
 
-func TestSetRunCustomID_ReflectedInGetRunAndStats(t *testing.T) {
+func TestSetRunTaskInfo_ReflectedInGetRunAndStats(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
@@ -254,12 +254,15 @@ func TestSetRunCustomID_ReflectedInGetRunAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TryEnqueue error: %v", err)
 	}
-	if run, err := s.GetRun(ctx, id); err != nil || run.CustomID != "" {
-		t.Fatalf("expected empty CustomID before SetRunCustomID, got %q (err=%v)", run.CustomID, err)
+	if run, err := s.GetRun(ctx, id); err != nil || run.CustomID != "" || run.TaskName != "" {
+		t.Fatalf("expected empty CustomID/TaskName before SetRunTaskInfo, got %q/%q (err=%v)", run.CustomID, run.TaskName, err)
 	}
 
-	if err := s.SetRunCustomID(ctx, id, "PNL-4528"); err != nil {
-		t.Fatalf("SetRunCustomID error: %v", err)
+	if err := s.SetRunTaskInfo(ctx, id, "PNL-4528", "Экспорт заказов"); err != nil {
+		t.Fatalf("SetRunTaskInfo error: %v", err)
+	}
+	if err := s.SetRunSlackMessage(ctx, id, "задача PNL-4528 прошла проверку"); err != nil {
+		t.Fatalf("SetRunSlackMessage error: %v", err)
 	}
 
 	run, err := s.GetRun(ctx, id)
@@ -268,6 +271,12 @@ func TestSetRunCustomID_ReflectedInGetRunAndStats(t *testing.T) {
 	}
 	if run.CustomID != "PNL-4528" {
 		t.Errorf("CustomID = %q, want PNL-4528", run.CustomID)
+	}
+	if run.TaskName != "Экспорт заказов" {
+		t.Errorf("TaskName = %q, want %q", run.TaskName, "Экспорт заказов")
+	}
+	if run.SlackMessage != "задача PNL-4528 прошла проверку" {
+		t.Errorf("SlackMessage = %q, want %q", run.SlackMessage, "задача PNL-4528 прошла проверку")
 	}
 
 	stats, err := s.Stats(ctx, time.Time{})
@@ -280,6 +289,9 @@ func TestSetRunCustomID_ReflectedInGetRunAndStats(t *testing.T) {
 			found = true
 			if r.CustomID != "PNL-4528" {
 				t.Errorf("Stats run CustomID = %q, want PNL-4528", r.CustomID)
+			}
+			if r.TaskName != "Экспорт заказов" {
+				t.Errorf("Stats run TaskName = %q, want %q", r.TaskName, "Экспорт заказов")
 			}
 		}
 	}

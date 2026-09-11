@@ -264,6 +264,48 @@
     border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 11.5px;
     max-height: 320px; overflow: auto; margin: 6px 0 0;
   }
+
+  .stage-chip.clickable { cursor: pointer; }
+  .stage-chip.clickable:hover { filter: brightness(0.94); }
+  :root[data-theme="dark"] .stage-chip.clickable:hover,
+  :root:not([data-theme="light"]) .stage-chip.clickable:hover { filter: brightness(1.25); }
+
+  tr.stats-row { cursor: pointer; }
+  tr.stats-row:hover td { background: var(--bg-soft); }
+  tr.stats-row td.link a { color: var(--accent); text-decoration: none; }
+  tr.stats-row td.link a:hover { text-decoration: underline; }
+  tr.detail-row td {
+    background: var(--bg-soft); padding: 12px 14px;
+  }
+  .run-detail .empty { padding: 2px 0; }
+  .run-detail .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .modal-overlay[hidden] { display: none; }
+  .modal-panel {
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    box-shadow: var(--shadow); max-width: 860px; width: 100%; max-height: 84vh;
+    display: flex; flex-direction: column;
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-head h3 { margin: 0; font-size: 14.5px; flex: 1; }
+  .modal-head .meta { font-size: 11.5px; color: var(--text-faint); }
+  .modal-close {
+    border: none; background: transparent; color: var(--text-dim); cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: 6px;
+  }
+  .modal-close:hover { background: var(--bg-soft); }
+  .modal-body { padding: 14px 16px; overflow: auto; }
+  .modal-body pre {
+    white-space: pre-wrap; word-break: break-word; margin: 0;
+    font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
 </style>
 </head>
 <body>
@@ -315,6 +357,17 @@
     <div id="sessions-body"><div class="empty">Загрузка…</div></div>
   </section>
 </main>
+
+<div class="modal-overlay" id="detail-modal" hidden>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h3 id="detail-modal-title"></h3>
+      <span class="meta" id="detail-modal-meta"></span>
+      <button class="modal-close" id="detail-modal-close" title="Закрыть">✕</button>
+    </div>
+    <div class="modal-body"><pre id="detail-modal-body"></pre></div>
+  </div>
+</div>
 
 <div class="toast-wrap" id="toast-wrap"></div>
 
@@ -384,6 +437,51 @@ function personHTML(m) {
     return `<span class="person"><img class="avatar" src="${esc(m.avatar)}" alt=""><span class="value">${label}</span></span>`;
   }
   return `<span class="person"><span class="avatar-fallback">${esc(initials(m.username || String(m.id)))}</span><span class="value">${label}</span></span>`;
+}
+
+// ---------- модальное окно с содержимым этапа ----------
+const detailModal = $("#detail-modal");
+function openDetailModal(title, meta, text) {
+  $("#detail-modal-title").textContent = title;
+  $("#detail-modal-meta").textContent = meta || "";
+  $("#detail-modal-body").textContent = text || "(пусто)";
+  detailModal.hidden = false;
+}
+function closeDetailModal() { detailModal.hidden = true; }
+$("#detail-modal-close").addEventListener("click", closeDetailModal);
+detailModal.addEventListener("click", (ev) => { if (ev.target === detailModal) closeDetailModal(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !detailModal.hidden) closeDetailModal(); });
+
+// run detail (этапы + вызовы claude + слак-сообщение по конкретному прогону,
+// см. GET /api/runs/{id}) — используется и раскрытой строкой статистики, и
+// кликом по этапу текущей задачи, чтобы не дублировать логику получения и
+// показа содержимого spec/review/slack (см. Требование «раскрывать лог
+// проверки и содержимое spec/review/slack по клику»).
+async function fetchRunDetail(runId) {
+  return api(`/api/runs/${encodeURIComponent(runId)}`);
+}
+function findInvocation(detail, stage) {
+  return (detail.invocations || []).slice().reverse().find(inv => inv.stage === stage);
+}
+function invocationMeta(inv) {
+  if (!inv) return "";
+  return `${esc(inv.model || "—")}/${esc(inv.effort || "—")} · ${fmtNum(inv.input_tokens)}/${fmtNum(inv.output_tokens)} токенов · ${fmtCost(inv.cost_usd)}`;
+}
+function openStageModal(detail, stage, label) {
+  const inv = findInvocation(detail, stage);
+  if (!inv) {
+    toast(`Этап «${label}» ещё не выполнялся`, "err");
+    return;
+  }
+  openDetailModal(`${label} — run #${detail.run.ID}`, invocationMeta(inv), inv.output || "(пустой ответ)");
+}
+function openSlackModal(detail) {
+  const text = detail.run && detail.run.SlackMessage;
+  if (!text) {
+    toast("Уведомление в Slack по этому прогону ещё не отправлялось", "err");
+    return;
+  }
+  openDetailModal(`Slack — run #${detail.run.ID}`, detail.run.TaskName || "", text);
 }
 
 // ---------- настройки ----------
@@ -516,12 +614,46 @@ const STAGE_LABELS = {
   review: "/review", decide: "решение", comment: "комментарий",
 };
 
-function stagesHTML(stages) {
+// CLICKABLE_STAGES — какие этапы вообще есть смысл открывать по клику: у
+// них есть содержательный ответ claude (см. STAGE_LABELS выше), в отличие
+// от setup/commands_check/git_fetch/decide/comment — там нечего показывать
+// кроме факта прохождения (уже видно по цвету чипа).
+const CLICKABLE_STAGES = { spec: true, review: true };
+
+function stagesHTML(stages, runId) {
   if (!stages || !stages.length) return "";
-  return '<div class="stages">' + stages.map(s =>
-    `<span class="stage-chip ${esc(s.Status || s.status)}">${esc(STAGE_LABELS[s.Stage || s.stage] || s.Stage || s.stage)}</span>`
-  ).join("") + "</div>";
+  return '<div class="stages">' + stages.map(s => {
+    const stage = s.Stage || s.stage;
+    const status = s.Status || s.status;
+    const label = STAGE_LABELS[stage] || stage;
+    const clickable = CLICKABLE_STAGES[stage] && status === "done" && runId != null;
+    const cls = "stage-chip " + esc(status) + (clickable ? " clickable" : "");
+    return clickable
+      ? `<span class="${cls}" data-run="${esc(runId)}" data-stage="${esc(stage)}" data-label="${esc(label)}" title="Посмотреть содержимое">${esc(label)}</span>`
+      : `<span class="${cls}">${esc(label)}</span>`;
+  }).join("") + "</div>";
 }
+
+// Делегирование клика по стейдж-чипам на весь документ: чипы рисуются и в
+// "Текущей задаче" (перерисовывается каждые 5с), и в раскрытых строках
+// статистики — вешать обработчик на каждый чип заново после каждой
+// перерисовки избыточно, один слушатель на document переживает любые
+// перерисовки контейнеров.
+document.addEventListener("click", async (ev) => {
+  const chip = ev.target.closest(".stage-chip.clickable");
+  if (!chip) return;
+  const runId = chip.dataset.run;
+  try {
+    const detail = await fetchRunDetail(runId);
+    if (chip.dataset.slack) {
+      openSlackModal(detail);
+    } else {
+      openStageModal(detail, chip.dataset.stage, chip.dataset.label);
+    }
+  } catch (e) {
+    toast(`Не удалось загрузить содержимое: ${e.message}`, "err");
+  }
+});
 
 async function taskAction(taskId, action, btn) {
   if (btn) btn.disabled = true;
@@ -635,12 +767,13 @@ async function loadQueue() {
               <button class="btn danger" data-act="cancel">⏹️ Прервать</button>
             </div>
           </div>
-          ${stagesHTML(a.stages)}
+          ${stagesHTML(a.stages, a.run_id)}
           <div class="tokens-line">
             <span>вход: <b>${fmtNum(a.input_tokens)}</b></span>
             <span>выход: <b>${fmtNum(a.output_tokens)}</b></span>
             <span>стоимость: <b>${fmtCost(a.cost_usd)}</b></span>
             <span>run #${esc(a.run_id)}</span>
+            <span class="stage-chip clickable" data-run="${esc(a.run_id)}" data-slack="1" title="Посмотреть сообщение в Slack, если оно уже отправлено">💬 slack</span>
           </div>
         </div>`;
       }).join("");
@@ -701,9 +834,44 @@ async function loadQueue() {
 
 // ---------- статистика ----------
 let statsWindow = "all";
+// expandedStatsRuns — какие строки таблицы статистики сейчас раскрыты, по
+// id прогона. Таблица целиком перерисовывается на каждый опрос (теперь
+// каждые 5с — см. refreshFast), поэтому состояние "раскрыто" держим не в
+// DOM, а здесь, и после перерисовки восстанавливаем (см. Требование «все
+// данные должны обновляться динамически», не сбрасывая раскрытые строки).
+const expandedStatsRuns = new Set();
+
 function verdictBadge(v) {
   if (!v) return "";
   return `<span class="badge ${esc(v)}">${esc(v)}</span>`;
+}
+
+// runDetailHTML строит содержимое раскрытой строки: лог этапов (кликабельные
+// чипы spec/review — та же логика, что и в "Текущей задаче", см.
+// stagesHTML) плюс явная кнопка Slack и, если прогон падал по инфраструктурной
+// причине (не по вердикту), текст ошибки.
+function runDetailHTML(detail) {
+  const run = detail.run;
+  const stages = detail.stages || [];
+  const parts = [stagesHTML(stages, run.ID)];
+  parts.push(`<div class="actions">
+    <span class="stage-chip clickable" data-run="${esc(run.ID)}" data-slack="1">💬 slack</span>
+  </div>`);
+  if (run.Error) {
+    parts.push(`<div class="empty" style="margin-top:8px;">Ошибка: ${esc(run.Error)}</div>`);
+  }
+  return parts.join("");
+}
+
+async function loadRunDetailInto(runId) {
+  const el = document.getElementById(`run-detail-${runId}`);
+  if (!el) return;
+  try {
+    const detail = await fetchRunDetail(runId);
+    el.innerHTML = runDetailHTML(detail);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.message)}</div>`;
+  }
 }
 
 async function loadStats() {
@@ -736,23 +904,50 @@ async function loadStats() {
       <table>
         <thead><tr><th>#</th><th>Задача</th><th>Статус</th><th>Вердикт</th><th>Токены</th><th>Стоимость</th><th>Начало</th></tr></thead>
         <tbody>
-          ${rows.length ? rows.map(r => `
-            <tr>
+          ${rows.length ? rows.map(r => {
+            const expanded = expandedStatsRuns.has(String(r.ID));
+            return `
+            <tr class="stats-row" data-run="${esc(r.ID)}">
               <td class="mono">${esc(r.ID)}</td>
-              <td class="mono" title="${esc(r.TaskID)}">${esc(r.CustomID || r.TaskID)}</td>
+              <td class="mono link"><a href="${esc(clickupURL(r.TaskID))}" target="_blank" rel="noopener" title="${esc(r.TaskName || r.TaskID)}">${esc(r.CustomID || r.TaskID)}</a></td>
               <td><span class="badge ${esc(r.Status)}">${esc(r.Status)}</span></td>
               <td>${verdictBadge(r.Verdict)}</td>
               <td>${fmtNum(r.InputTokens)} / ${fmtNum(r.OutputTokens)}</td>
               <td>${fmtCost(r.CostUSD)}</td>
               <td>${fmtDur(r.StartedAt)}</td>
-            </tr>`).join("") : '<tr><td colspan="7" class="empty">Нет прогонов за этот период</td></tr>'}
+            </tr>
+            <tr class="detail-row" data-detail-for="${esc(r.ID)}" ${expanded ? "" : "hidden"}>
+              <td colspan="7"><div class="run-detail" id="run-detail-${esc(r.ID)}">Загрузка…</div></td>
+            </tr>`;
+          }).join("") : '<tr><td colspan="7" class="empty">Нет прогонов за этот период</td></tr>'}
         </tbody>
       </table>
       </div>`;
+
+    for (const runId of expandedStatsRuns) {
+      loadRunDetailInto(runId);
+    }
   } catch (e) {
     body.innerHTML = `<div class="empty">Не удалось загрузить статистику: ${esc(e.message)}</div>`;
   }
 }
+
+$("#stats-body").addEventListener("click", (ev) => {
+  if (ev.target.closest("a, .stage-chip")) return; // ссылка на задачу и клики по чипам — своя логика
+  const row = ev.target.closest("tr.stats-row");
+  if (!row) return;
+  const runId = row.dataset.run;
+  const detailRow = $(`tr.detail-row[data-detail-for="${CSS.escape(runId)}"]`);
+  if (!detailRow) return;
+  if (expandedStatsRuns.has(runId)) {
+    expandedStatsRuns.delete(runId);
+    detailRow.hidden = true;
+  } else {
+    expandedStatsRuns.add(runId);
+    detailRow.hidden = false;
+    loadRunDetailInto(runId);
+  }
+});
 
 $$("#stats-tabs .tab").forEach(tab => {
   tab.addEventListener("click", () => {
@@ -789,9 +984,14 @@ async function loadSessions() {
       </div>
       <div id="sessions-list"></div>`;
 
+    // Список тоже перерисовывается на быстром цикле (5с) — сохраняем, какие
+    // <details> сейчас открыты (по id вызова), чтобы не закрывать их каждый
+    // опрос (см. Требование «все данные должны обновляться динамически»).
+    const openIDs = new Set($$("details.session[open]", body).map(d => d.dataset.id));
+
     const listEl = $("#sessions-list");
     listEl.innerHTML = list.map(inv => `
-      <details class="session">
+      <details class="session" data-id="${esc(inv.id)}" ${openIDs.has(String(inv.id)) ? "open" : ""}>
         <summary>
           <span class="badge ${inv.is_error ? "fail" : "pass"}">${inv.is_error ? "ошибка" : "ok"}</span>
           <b>${esc(inv.stage)}</b>
@@ -829,8 +1029,16 @@ setInterval(() => {
   $("#refresh-pill").textContent = sec < 2 ? "● обновлено только что" : `обновлено ${sec}с назад`;
 }, 1000);
 
+// Статистика и сессии переехали на быстрый (5с) цикл вместе с очередью —
+// у них нет собственных полей ввода вроде select, которые полный refresh
+// мог бы сбросить, только раскрытые строки (см. expandedStatsRuns) и модальное
+// окно (не пересоздаётся перерисовкой, живёт отдельно от body.innerHTML)
+// (см. Требование «все данные страницы должны обновляться динамически»).
+// Настройки остаются на медленном цикле — они меняются редко, а их поля
+// (select модели/effort) требуют более осторожного восстановления состояния
+// (см. loadSettings/captureRowSelections).
 async function refreshFast() {
-  await loadQueue();
+  await Promise.all([loadQueue(), loadStats(), loadSessions()]);
   touchRefreshPill();
 }
 async function refreshAll() {

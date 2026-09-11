@@ -16,14 +16,17 @@ import (
 )
 
 type fakeClickUpReader struct {
-	task       *clickup.Task
-	tasksByID  map[string]*clickup.Task
-	taskErr    error
-	members    []clickup.Member
-	memErr     error
-	otherTasks []clickup.Task
-	otherErr   error
-	gotStatus  string
+	task         *clickup.Task
+	tasksByID    map[string]*clickup.Task
+	taskErr      error
+	members      []clickup.Member
+	memErr       error
+	otherTasks   []clickup.Task
+	otherErr     error
+	gotStatus    string
+	queuedTasks  []clickup.Task
+	queuedErr    error
+	gotQueuedTag string
 }
 
 func (f *fakeClickUpReader) GetTask(ctx context.Context, taskID string) (*clickup.Task, error) {
@@ -42,6 +45,11 @@ func (f *fakeClickUpReader) GetTeamMembers(ctx context.Context) ([]clickup.Membe
 func (f *fakeClickUpReader) ListTasksByStatus(ctx context.Context, listID, status string) ([]clickup.Task, error) {
 	f.gotStatus = status
 	return f.otherTasks, f.otherErr
+}
+
+func (f *fakeClickUpReader) ListTasksByTagAndStatus(ctx context.Context, listID, tag, status string) ([]clickup.Task, error) {
+	f.gotQueuedTag = tag
+	return f.queuedTasks, f.queuedErr
 }
 
 // fakeRunnerControl — фейковая реализация RunnerControl.
@@ -106,9 +114,13 @@ func TestConfigHandler_NoConfig_Returns500(t *testing.T) {
 }
 
 func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
+	// pending теперь опрашивается напрямую у ClickUp (тег+статус триггера),
+	// а не из внутреннего буфера очереди (см. Queue.Pending) — так дашборд
+	// не копит дубли, если сверка несколько раз подряд находит одну и ту же
+	// ещё не взятую в обработку задачу, и не зависит от того, успел ли этот
+	// процесс сам когда-либо положить task_id в свой буфер.
 	sub := &fakeSubmitter{
-		active:  []queue.ActiveRunInfo{{TaskID: "t1", RunID: 5}},
-		pending: []string{"t2", "t3"},
+		active: []queue.ActiveRunInfo{{TaskID: "t1", RunID: 5}},
 	}
 	st := &fakePinger{
 		run:    &store.Run{ID: 5, TaskID: "t1", Status: "running", InputTokens: 10, OutputTokens: 20, CostUSD: 0.01},
@@ -116,11 +128,16 @@ func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
 	}
 	cu := &fakeClickUpReader{
 		task: &clickup.Task{ID: "t1", Name: "Task One", URL: "https://x/t1"},
-		tasksByID: map[string]*clickup.Task{
-			"t2": {ID: "t2", CustomID: "PNL-2", Name: "Task Two", URL: "https://x/t2"},
+		queuedTasks: []clickup.Task{
+			{ID: "t2", CustomID: "PNL-2", Name: "Task Two", URL: "https://x/t2"},
+			// t1 тоже формально ещё числится с тегом+статусом триггера на
+			// момент опроса ClickUp (короткое окно до SetStatus в setup) —
+			// должна быть исключена из pending, раз уже показана в active.
+			{ID: "t1", CustomID: "PNL-1", Name: "Task One", URL: "https://x/t1"},
 		},
 	}
-	deps := Deps{Queue: sub, Store: st, ClickUp: cu, Logger: discardLogger()}
+	cfg := &config.Config{CUListID: "list1", TriggerTag: "ai", StatusTrigger: "to check"}
+	deps := Deps{Queue: sub, Store: st, ClickUp: cu, Cfg: cfg, Logger: discardLogger()}
 	mux := NewMux(deps)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
@@ -154,16 +171,14 @@ func TestQueueHandler_ReturnsActiveAndPending(t *testing.T) {
 	if body.Active[0].Status != "running" || len(body.Active[0].Stages) != 1 {
 		t.Errorf("unexpected active run details: %+v", body.Active[0])
 	}
-	if len(body.Pending) != 2 || body.Pending[0].TaskID != "t2" {
-		t.Errorf("unexpected pending: %+v", body.Pending)
+	if len(body.Pending) != 1 || body.Pending[0].TaskID != "t2" {
+		t.Errorf("expected only t2 in pending (t1 excluded as active), got: %+v", body.Pending)
 	}
 	if body.Pending[0].CustomID != "PNL-2" || body.Pending[0].Name != "Task Two" {
 		t.Errorf("expected pending[0] resolved to custom_id/name, got %+v", body.Pending[0])
 	}
-	// t3 не найдена в fakeClickUpReader.tasksByID — фолбэк на f.task (общий
-	// GetTask-результат этого фейка), а не падение/пустая запись.
-	if body.Pending[1].TaskID != "t3" {
-		t.Errorf("expected pending[1].task_id = t3, got %+v", body.Pending[1])
+	if cu.gotQueuedTag != "ai" {
+		t.Errorf("expected ListTasksByTagAndStatus called with tag %q, got %q", "ai", cu.gotQueuedTag)
 	}
 }
 

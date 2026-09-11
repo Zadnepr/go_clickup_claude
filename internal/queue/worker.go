@@ -74,20 +74,61 @@ func isEligible(task *clickup.Task, cfg *config.Config) bool {
 	if task.ListID != cfg.CUListID {
 		return false
 	}
-
-	wantTag := config.NormalizeStatus(cfg.TriggerTag)
-	hasTag := false
-	for _, tag := range task.Tags {
-		if config.NormalizeStatus(tag) == wantTag {
-			hasTag = true
-			break
-		}
-	}
-	if !hasTag {
+	if !hasTriggerTag(task, cfg) {
 		return false
 	}
-
 	return config.NormalizeStatus(task.Status) == config.NormalizeStatus(cfg.StatusTrigger)
+}
+
+// hasTriggerTag проверяет только наличие TRIGGER_TAG на задаче, без статуса
+// и списка — общая часть isEligible и resumable.
+func hasTriggerTag(task *clickup.Task, cfg *config.Config) bool {
+	wantTag := config.NormalizeStatus(cfg.TriggerTag)
+	for _, tag := range task.Tags {
+		if config.NormalizeStatus(tag) == wantTag {
+			return true
+		}
+	}
+	return false
+}
+
+// resumable проверяет, что прерванную падением/перезапуском сервиса
+// проверку (см. resumeTask, Store.RecoverFromRestart) вообще стоит
+// доводить до конца: пока сервис был недоступен, задачу могли обработать
+// вручную — проверить, перевести статус или снять тег. Условие мягче
+// isEligible (не требует STATUS_TRIGGER жёстко): прогон мог прерваться уже
+// после того, как setup перевёл карточку в STATUS_RUNNING, поэтому
+// допустимы обе колонки — исходная триггерная и рабочая. Тег обязателен
+// в обоих случаях: его снимает только успешно отработавший decide, значит
+// его отсутствие — надёжный признак того, что кто-то (человек или более
+// ранний прогон) уже закрыл вопрос по этой задаче без нас.
+func resumable(task *clickup.Task, cfg *config.Config) bool {
+	if !hasTriggerTag(task, cfg) {
+		return false
+	}
+	status := config.NormalizeStatus(task.Status)
+	return status == config.NormalizeStatus(cfg.StatusTrigger) || status == config.NormalizeStatus(cfg.StatusRunning)
+}
+
+// staleAssignees возвращает тех из current, кого нет среди want — то, что
+// осталось на задаче не по воле этого прогона (например, человек, который
+// вручную проверял задачу параллельно, пока она лежала в STATUS_RUNNING) и
+// должно быть снято при переходе по вердикту (см. decide в runReview).
+func staleAssignees(current, want []int) []int {
+	if len(current) == 0 {
+		return nil
+	}
+	wantSet := make(map[int]bool, len(want))
+	for _, id := range want {
+		wantSet[id] = true
+	}
+	var stale []int
+	for _, id := range current {
+		if !wantSet[id] {
+			stale = append(stale, id)
+		}
+	}
+	return stale
 }
 
 // belongsToConfiguredList проверяет только принадлежность задачи
@@ -170,8 +211,8 @@ func (q *Queue) processTask(taskID string, opts RunOptions) {
 		log.Debug("task already has an active or completed run, skipping")
 		return
 	}
-	if err := q.deps.Store.SetRunCustomID(ctx, runID, task.CustomID); err != nil {
-		log.Error("failed to record custom_id for run", "error", err.Error())
+	if err := q.deps.Store.SetRunTaskInfo(ctx, runID, task.CustomID, task.Name); err != nil {
+		log.Error("failed to record task info for run", "error", err.Error())
 	}
 
 	q.registerActive(taskID, runID, cancel)
@@ -215,8 +256,25 @@ func (q *Queue) resumeTask(taskID string) {
 		log.Debug("resumed task already has an active or completed run, skipping")
 		return
 	}
-	if err := q.deps.Store.SetRunCustomID(ctx, runID, task.CustomID); err != nil {
-		log.Error("failed to record custom_id for run", "error", err.Error())
+	if err := q.deps.Store.SetRunTaskInfo(ctx, runID, task.CustomID, task.Name); err != nil {
+		log.Error("failed to record task info for run", "error", err.Error())
+	}
+
+	// Пока сервис был недоступен, карточку могли обработать вручную —
+	// проверить, перевести статус или снять тег-триггер. Дожимать прерванную
+	// проверку в этом случае не нужно: её результат уже никого не интересует,
+	// а по итогу можно ещё и наложить устаревший вердикт поверх того, что
+	// сделал человек (см. Требование «синхронизировать состояние
+	// восстановленной задачи»). Сама карточка не трогается — ни статус, ни
+	// тег, ни исполнитель: раз её кто-то обработал сам, вмешиваться не надо.
+	if !resumable(task, cfg) {
+		msg := fmt.Sprintf(
+			"задача больше не в колонке %q/%q с тегом %q — похоже, её обработали вручную, пока сервис был недоступен; возобновление отменено",
+			cfg.StatusTrigger, cfg.StatusRunning, cfg.TriggerTag)
+		log.Info("task no longer matches trigger tag/status after restart, abandoning resume",
+			"status", task.Status, "tags", task.Tags)
+		q.markFailed(ctx, log, runID, "", msg, review.TokenUsage{})
+		return
 	}
 
 	log.Info("resuming review interrupted by a previous instance")
@@ -370,13 +428,27 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		log.Warn("review output had no parsable ИТОГ line, treating as blocked")
 	}
 
+	// Всё, что идёт дальше (комментарий, перевод статуса/исполнителя,
+	// уведомление в Slack), сознательно переходит на независимый от ctx
+	// прогона контекст (см. wrapUpCtx). spec+review обычно и съедают
+	// большую часть общего ReviewTimeout (в этом сервисе на практике —
+	// частые 12-17 минут вдвоём при бюджете в 15), так что к этому месту
+	// от исходного ctx может остаться доли секунды или он уже истёк. Без
+	// отдельного контекста это утаскивает за собой ровно ту работу, которая
+	// обязана произойти после успешного ревью: карточка так и остаётся в
+	// STATUS_RUNNING с тегом-триггером, а уведомление о готовом результате
+	// не уходит — снаружи это неотличимо от «задача зависла», хотя ревью
+	// уже реально отработало и стоило денег.
+	wctx, wcancel := wrapUpCtx()
+	defer wcancel()
+
 	commentText := strings.TrimSpace(stripVerdictLine(reviewData.Output, verdict.Raw))
 	if commentText != "" {
 		// Комментарий — единственный этап без данных для восстановления:
 		// важен сам факт «уже опубликован», иначе возобновление продублирует
 		// его в задаче, а ClickUp такие дубли не схлопывает.
-		stageRun(ctx, q, log, runID, stageComment, func() (struct{}, error) {
-			q.postComment(ctx, log, task.ID, commentText)
+		stageRun(wctx, q, log, runID, stageComment, func() (struct{}, error) {
+			q.postComment(wctx, log, task.ID, commentText)
 			return struct{}{}, nil
 		})
 	}
@@ -391,11 +463,11 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 	var targetStatus string
 	var assigneeIDs []int
 	if reviewErr == nil {
-		decide, _, _ := stageRun(ctx, q, log, runID, stageDecide, func() (decideStageData, error) {
+		decide, _, _ := stageRun(wctx, q, log, runID, stageDecide, func() (decideStageData, error) {
 			ts, ids := Decide(verdict, cfg, task.CreatorID, task.DeveloperIDs)
 
 			if ts != "" {
-				if err := q.deps.ClickUp.SetStatus(ctx, task.ID, ts); err != nil {
+				if err := q.deps.ClickUp.SetStatus(wctx, task.ID, ts); err != nil {
 					log.Error("failed to move task to target status",
 						"attempted_status", ts,
 						"available_statuses", task.AvailableStatuses,
@@ -403,14 +475,31 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 				}
 			}
 
+			// Свежий список исполнителей: setup снял тех, кто был назначен ДО
+			// начала проверки, но пока задача лежала в STATUS_RUNNING, на неё
+			// мог назначиться кто-то ещё вручную — например, человек, который
+			// параллельно сам её проверял. После вердикта на задаче должен
+			// остаться только целевой исполнитель (ids), а не любой, кто
+			// оказался назначен по ходу (см. Требование «после переноса в
+			// rework должен остаться только исполнитель, проверяющий должен
+			// сняться»). task.Assignees — то, что было на момент начала этого
+			// прогона, поэтому берём карточку заново, а не полагаемся на неё.
+			if fresh, err := q.deps.ClickUp.GetTask(wctx, task.ID); err != nil {
+				log.Error("failed to fetch fresh assignees before deciding, skipping stale-assignee cleanup", "error", err.Error())
+			} else if stale := staleAssignees(fresh.Assignees, ids); len(stale) > 0 {
+				if err := q.deps.ClickUp.RemoveAssignees(wctx, task.ID, stale); err != nil {
+					log.Error("failed to remove stale assignees", "assignees", stale, "error", err.Error())
+				}
+			}
+
 			if len(ids) > 0 {
-				if err := q.deps.ClickUp.AddAssignees(ctx, task.ID, ids); err != nil {
+				if err := q.deps.ClickUp.AddAssignees(wctx, task.ID, ids); err != nil {
 					log.Error("failed to add assignees", "assignees", ids, "error", err.Error())
 				}
 			}
 
 			if cfg.TriggerTag != "" {
-				if err := q.deps.ClickUp.RemoveTag(ctx, task.ID, cfg.TriggerTag); err != nil {
+				if err := q.deps.ClickUp.RemoveTag(wctx, task.ID, cfg.TriggerTag); err != nil {
 					log.Error("failed to remove trigger tag", "tag", cfg.TriggerTag, "error", err.Error())
 				}
 			}
@@ -420,7 +509,7 @@ func (q *Queue) runReview(ctx context.Context, log *slog.Logger, task *clickup.T
 		assigneeIDs = decide.AssigneeIDs
 	}
 
-	q.notifyReviewResult(ctx, log, task, verdict, cfg.StatusRunning, targetStatus, assigneeIDs, reviewData.SessionID, reviewErr)
+	q.notifyReviewResult(wctx, log, runID, task, verdict, cfg.StatusRunning, targetStatus, assigneeIDs, reviewData.SessionID, reviewErr)
 
 	if reviewErr != nil {
 		errMsg := reviewErr.Error()
@@ -542,6 +631,22 @@ func finalizeCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 10*time.Second)
 }
 
+// wrapUpCtx — независимый от ctx прогона контекст для всего, что должно
+// произойти ПОСЛЕ успешного /review-go (комментарий, перевод статуса и
+// исполнителя, уведомление в Slack — см. использование в runReview). Эта
+// работа не должна зависеть от того, сколько бюджета ReviewTimeout уже
+// потратили /spec-go и /review-go: они регулярно вдвоём занимают большую
+// часть таймаута, и с общим ctx завершающие шаги получали бы то, что от
+// него осталось — иногда доли секунды, — из-за чего задача формально
+// «проверена», но так и остаётся висеть в running-колонке с тегом-триггером
+// и без уведомления. Таймаут здесь на порядок щедрее finalizeCtx (10с),
+// потому что тут не одна короткая запись в SQLite, а несколько
+// последовательных вызовов ClickUp API (каждый — со своими попытками при
+// rate limit, см. internal/clickup) плюс Slack.
+func wrapUpCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 3*time.Minute)
+}
+
 func storeUsage(u review.TokenUsage) store.Usage {
 	return store.Usage{
 		InputTokens:  int64(u.InputTokens),
@@ -659,8 +764,10 @@ func stripVerdictLine(output, raw string) string {
 // notifyReviewResult шлёт в Slack и в консоль короткое сообщение о том, что
 // сделано: задача и куда она перемещена. Для blocked и внутренних ошибок
 // сервиса сообщение отдельное и содержит причину — молчаливый отказ хуже
-// ложного срабатывания.
-func (q *Queue) notifyReviewResult(ctx context.Context, log *slog.Logger, task *clickup.Task, verdict review.Verdict, fromStatus, toStatus string, assigneeIDs []int, sessionID string, reviewErr error) {
+// ложного срабатывания. Текст сообщения также сохраняется на прогоне (см.
+// Store.SetRunSlackMessage), чтобы дашборд мог показать его по клику из
+// истории (см. Требование «посмотреть коммент, отправленный в slack»).
+func (q *Queue) notifyReviewResult(ctx context.Context, log *slog.Logger, runID int64, task *clickup.Task, verdict review.Verdict, fromStatus, toStatus string, assigneeIDs []int, sessionID string, reviewErr error) {
 	n := slack.ReviewNotification{
 		TaskName:   task.Name,
 		TaskURL:    task.URL,
@@ -691,6 +798,9 @@ func (q *Queue) notifyReviewResult(ctx context.Context, log *slog.Logger, task *
 
 	if err := q.deps.Slack.Send(ctx, text, blocks); err != nil {
 		log.Error("failed to send slack notification", "error", err.Error())
+	}
+	if err := q.deps.Store.SetRunSlackMessage(ctx, runID, text); err != nil {
+		log.Error("failed to record slack message for run", "error", err.Error())
 	}
 
 	log.Info(fmt.Sprintf("задача «%s» обработана: %s → %s", task.Name, fromStatus, toStatus),

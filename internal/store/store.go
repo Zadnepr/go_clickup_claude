@@ -38,11 +38,18 @@ type Run struct {
 	ID     int64
 	TaskID string
 	// CustomID — человекочитаемый ID задачи в ClickUp (например, "PNL-4528"),
-	// если он был на ней задан (см. SetRunCustomID) — отдельно от TaskID
+	// если он был на ней задан (см. SetRunTaskInfo) — отдельно от TaskID
 	// (нативный ID ClickUp), чтобы дашборд показывал знакомое имя задачи, а
 	// не непрозрачный ID. Пусто для прогонов, начатых до этой возможности,
 	// или если у задачи не задан кастомный ID.
-	CustomID     string
+	CustomID string
+	// TaskName — название задачи в ClickUp на момент старта прогона (см.
+	// SetRunTaskInfo) — вместе с CustomID/TaskID нужно дашборду, чтобы
+	// показать ссылку на задачу в таблице статистики с названием во
+	// всплывающей подсказке, не обращаясь к ClickUp заново на каждый прогон
+	// из истории (см. Требование «в статистике — ссылка на задачу с
+	// названием при наведении»).
+	TaskName     string
 	Status       string
 	Verdict      string
 	SessionID    string
@@ -52,6 +59,11 @@ type Run struct {
 	InputTokens  int64
 	OutputTokens int64
 	CostUSD      float64
+	// SlackMessage — точный текст последнего уведомления о результате
+	// ревью, отправленного в Slack (см. Queue.notifyReviewResult) — чтобы
+	// дашборд мог показать его по клику, не восстанавливая заново из
+	// вердикта (см. Требование «посмотреть коммент, отправленный в slack»).
+	SlackMessage string
 }
 
 // Usage — токены и стоимость одного прогона (сумма /spec-go + /review-go).
@@ -246,6 +258,8 @@ func migrateRunColumns(db *sql.DB) error {
 		{"output_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"cost_usd", "REAL NOT NULL DEFAULT 0"},
 		{"custom_id", "TEXT NOT NULL DEFAULT ''"},
+		{"task_name", "TEXT NOT NULL DEFAULT ''"},
+		{"slack_message", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range columns {
 		if existing[c.name] {
@@ -353,16 +367,29 @@ func (s *Store) MarkRunning(ctx context.Context, runID int64) error {
 	return nil
 }
 
-// SetRunCustomID записывает человекочитаемый ID задачи (например,
-// "PNL-4528") на уже созданную запись прогона — вызывается сразу после
-// ReopenOrEnqueue/TryEnqueue, как только известна карточка задачи (см.
-// Requirement: дашборд должен показывать знакомое имя задачи, а не
-// непрозрачный ID ClickUp). Пустой customID — не редкость (не у каждой
-// задачи он задан) и не считается ошибкой.
-func (s *Store) SetRunCustomID(ctx context.Context, runID int64, customID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET custom_id = ? WHERE id = ?`, customID, runID)
+// SetRunTaskInfo записывает человекочитаемый ID задачи (например,
+// "PNL-4528") и её название на уже созданную запись прогона — вызывается
+// сразу после ReopenOrEnqueue/TryEnqueue, как только известна карточка
+// задачи (см. Requirement: дашборд должен показывать знакомое имя задачи, а
+// не непрозрачный ID ClickUp, и ссылку на задачу с названием во всплывающей
+// подсказке в таблице статистики). Пустые значения — не редкость (не у
+// каждой задачи задан custom ID) и не считаются ошибкой.
+func (s *Store) SetRunTaskInfo(ctx context.Context, runID int64, customID, name string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET custom_id = ?, task_name = ? WHERE id = ?`, customID, name, runID)
 	if err != nil {
-		return fmt.Errorf("set custom_id for run %d: %w", runID, err)
+		return fmt.Errorf("set task info for run %d: %w", runID, err)
+	}
+	return nil
+}
+
+// SetRunSlackMessage записывает точный текст последнего уведомления в
+// Slack о результате ревью (см. Queue.notifyReviewResult) — чтобы дашборд
+// мог показать его по клику на прогоне из истории, без восстановления по
+// вердикту (см. Требование «посмотреть коммент, отправленный в slack»).
+func (s *Store) SetRunSlackMessage(ctx context.Context, runID int64, text string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET slack_message = ? WHERE id = ?`, text, runID)
+	if err != nil {
+		return fmt.Errorf("set slack message for run %d: %w", runID, err)
 	}
 	return nil
 }
@@ -682,11 +709,11 @@ func (s *Store) Ping(ctx context.Context) error {
 func (s *Store) GetRun(ctx context.Context, runID int64) (*Run, error) {
 	var r Run
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, task_id, custom_id, status, verdict, session_id, started_at, finished_at, error,
-		       input_tokens, output_tokens, cost_usd
+		SELECT id, task_id, custom_id, task_name, status, verdict, session_id, started_at, finished_at, error,
+		       input_tokens, output_tokens, cost_usd, slack_message
 		FROM runs WHERE id = ?
-	`, runID).Scan(&r.ID, &r.TaskID, &r.CustomID, &r.Status, &r.Verdict, &r.SessionID, &r.StartedAt, &r.FinishedAt, &r.Error,
-		&r.InputTokens, &r.OutputTokens, &r.CostUSD)
+	`, runID).Scan(&r.ID, &r.TaskID, &r.CustomID, &r.TaskName, &r.Status, &r.Verdict, &r.SessionID, &r.StartedAt, &r.FinishedAt, &r.Error,
+		&r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.SlackMessage)
 	if err != nil {
 		return nil, fmt.Errorf("get run %d: %w", runID, err)
 	}
@@ -697,8 +724,8 @@ func (s *Store) GetRun(ctx context.Context, runID int64) (*Run, error) {
 // эндпоинта GET /api/status.
 func (s *Store) ListActive(ctx context.Context) ([]Run, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, task_id, custom_id, status, verdict, session_id, started_at, finished_at, error,
-		       input_tokens, output_tokens, cost_usd
+		SELECT id, task_id, custom_id, task_name, status, verdict, session_id, started_at, finished_at, error,
+		       input_tokens, output_tokens, cost_usd, slack_message
 		FROM runs WHERE status IN (?, ?) ORDER BY started_at ASC
 	`, StatusQueued, StatusRunning)
 	if err != nil {
@@ -713,8 +740,8 @@ func (s *Store) ListActive(ctx context.Context) ([]Run, error) {
 // не раньше since — для эндпоинта GET /api/stats.
 func (s *Store) Stats(ctx context.Context, since time.Time) (Stats, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, task_id, custom_id, status, verdict, session_id, started_at, finished_at, error,
-		       input_tokens, output_tokens, cost_usd
+		SELECT id, task_id, custom_id, task_name, status, verdict, session_id, started_at, finished_at, error,
+		       input_tokens, output_tokens, cost_usd, slack_message
 		FROM runs WHERE started_at >= ? ORDER BY started_at DESC
 	`, since.UTC())
 	if err != nil {
@@ -750,8 +777,8 @@ func scanRuns(rows *sql.Rows) ([]Run, error) {
 	var runs []Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.ID, &r.TaskID, &r.CustomID, &r.Status, &r.Verdict, &r.SessionID, &r.StartedAt, &r.FinishedAt, &r.Error,
-			&r.InputTokens, &r.OutputTokens, &r.CostUSD); err != nil {
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.CustomID, &r.TaskName, &r.Status, &r.Verdict, &r.SessionID, &r.StartedAt, &r.FinishedAt, &r.Error,
+			&r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.SlackMessage); err != nil {
 			return nil, fmt.Errorf("scan run row: %w", err)
 		}
 		runs = append(runs, r)

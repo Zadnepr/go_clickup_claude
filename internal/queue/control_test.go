@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 )
 
@@ -83,5 +84,38 @@ func TestPending_TracksBufferedTasks(t *testing.T) {
 	pending = q.Pending()
 	if len(pending) != 1 || pending[0] != "b" {
 		t.Fatalf("expected only 'b' left pending, got: %+v", pending)
+	}
+}
+
+func TestSubmit_SkipsDuplicateOfAlreadyPendingTask(t *testing.T) {
+	// Воспроизводит "в очереди много дублей задач": сверка находит одну и
+	// ту же ещё не взятую в обработку задачу на нескольких циклах подряд,
+	// пока единственный воркер занят другой проверкой. Submit не должен
+	// класть в буфер второй экземпляр того же task_id.
+	q := New(Deps{Logger: slog.New(slog.NewTextHandler(nil2Writer{}, nil))}, 10)
+
+	if !q.Submit("a") {
+		t.Fatal("expected first Submit('a') to succeed")
+	}
+	if q.Submit("a") {
+		t.Fatal("expected second Submit('a') to be skipped as a duplicate")
+	}
+
+	pending := q.Pending()
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly one pending entry for 'a', got: %+v", pending)
+	}
+}
+
+func TestSubmit_SkipsDuplicateOfActiveTask(t *testing.T) {
+	q := New(Deps{Logger: slog.New(slog.NewTextHandler(nil2Writer{}, nil))}, 10)
+	q.registerActive("a", 1, func() {})
+	defer q.unregisterActive("a")
+
+	if q.Submit("a") {
+		t.Fatal("expected Submit('a') to be skipped while 'a' is already active")
+	}
+	if len(q.Pending()) != 0 {
+		t.Fatalf("expected no pending entries, got: %+v", q.Pending())
 	}
 }

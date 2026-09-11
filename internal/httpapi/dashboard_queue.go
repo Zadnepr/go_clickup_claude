@@ -100,9 +100,12 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		active := make([]activeRunView, 0, len(deps.Queue.ActiveRuns()))
+		activeRuns := deps.Queue.ActiveRuns()
+		active := make([]activeRunView, 0, len(activeRuns))
+		activeTaskIDs := make(map[string]bool, len(activeRuns))
 
-		for _, ar := range deps.Queue.ActiveRuns() {
+		for _, ar := range activeRuns {
+			activeTaskIDs[ar.TaskID] = true
 			view := activeRunView{TaskID: ar.TaskID, RunID: ar.RunID}
 
 			if run, err := deps.Store.GetRun(ctx, ar.RunID); err == nil {
@@ -136,25 +139,38 @@ func newQueueHandler(deps Deps) http.HandlerFunc {
 			return members
 		}
 
-		// pending — задачи из буфера очереди (см. Queue.Pending), пока это
-		// только "голые" task_id. Разрешаем их в тот же вид, что и остальные
-		// списки (custom_id, название, аватарки исполнителей) — иначе
-		// дашборд может показать только ID задачи вместо PNL-<...> и имени
-		// (см. Требование «в статистике/списках — custom_id и имя, а не
-		// сырой ID ClickUp»).
+		// pending — опрашивается напрямую у ClickUp (тег-триггер + статус-
+		// триггер), тем же способом, что и otherToCheck ниже, а не через
+		// внутренний буфер очереди (Queue.Pending): тот отражает только то,
+		// что этот процесс сам успел поставить в канал, и после рестарта
+		// пуст, пока не отработает сверка (до RECONCILE_INTERVAL) — задача с
+		// уже добавленным тегом при этом не видна в дашборде, хотя условие
+		// триггера выполнено. Хуже того, буфер копил дубли одного и того же
+		// task_id, если сверка находила его на нескольких циклах подряд, пока
+		// единственный воркер был занят другой проверкой (см. Требование
+		// «в очереди много дублей задач, такого не должно быть»). Живой
+		// запрос к ClickUp свободен от обеих проблем: каждая задача
+		// возвращается ровно один раз и точно отражает доску прямо сейчас.
+		// Активная прямо сейчас задача исключается: она уже показана в
+		// "Текущей задаче", даже если карточка ещё не успела перейти в
+		// STATUS_RUNNING (короткое окно между взятием в обработку и
+		// фактическим SetStatus в начале runReview).
 		pending := []otherTaskView{}
-		if deps.ClickUp != nil {
-			for _, taskID := range deps.Queue.Pending() {
-				view := otherTaskView{TaskID: taskID, URL: "https://app.clickup.com/t/" + taskID}
-				if task, err := taskCache.Get(ctx, deps.ClickUp, taskID); err == nil {
-					view.CustomID = task.CustomID
-					view.Name = task.Name
-					view.URL = task.URL
-					view.Assignees = resolveAssigneeRefs(task.Assignees, loadMembersOnce())
-				} else {
-					deps.Logger.Warn("failed to load pending task details", "task_id", taskID, "error", err.Error())
+		if deps.ClickUp != nil && deps.Cfg != nil && deps.Cfg.TriggerTag != "" && deps.Cfg.StatusTrigger != "" {
+			tasks, err := deps.ClickUp.ListTasksByTagAndStatus(ctx, deps.Cfg.CUListID, deps.Cfg.TriggerTag, deps.Cfg.StatusTrigger)
+			if err != nil {
+				deps.Logger.Warn("failed to list queued tasks", "error", err.Error())
+			} else {
+				members := loadMembersOnce()
+				for _, task := range tasks {
+					if activeTaskIDs[task.ID] {
+						continue
+					}
+					pending = append(pending, otherTaskView{
+						TaskID: task.ID, CustomID: task.CustomID, Name: task.Name, URL: task.URL,
+						Assignees: resolveAssigneeRefs(task.Assignees, members),
+					})
 				}
-				pending = append(pending, view)
 			}
 		}
 

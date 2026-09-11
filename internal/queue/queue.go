@@ -83,6 +83,10 @@ func (q *Queue) Submit(taskID string) bool {
 // этого конкретного запуска (см. RunOptions) — используется ручным запуском
 // из веб-интерфейса, когда для задачи явно выбрана другая модель/effort.
 func (q *Queue) SubmitWithOptions(taskID string, opts RunOptions) bool {
+	if q.alreadyQueuedOrActive(taskID) {
+		q.deps.Logger.Debug("task already queued or being processed, skipping duplicate submit", "task_id", taskID)
+		return false
+	}
 	select {
 	case q.ch <- queueItem{taskID: taskID, opts: opts}:
 		q.addPending(taskID)
@@ -100,6 +104,10 @@ func (q *Queue) SubmitWithOptions(taskID string, opts RunOptions) bool {
 // до конца независимо от того, как сейчас выглядит карточка в ClickUp
 // (например, она может застрять в колонке STATUS_RUNNING без тега).
 func (q *Queue) SubmitResume(taskID string) bool {
+	if q.alreadyQueuedOrActive(taskID) {
+		q.deps.Logger.Debug("resumed task already queued or being processed, skipping duplicate submit", "task_id", taskID)
+		return false
+	}
 	select {
 	case q.ch <- queueItem{taskID: taskID, resume: true}:
 		q.addPending(taskID)

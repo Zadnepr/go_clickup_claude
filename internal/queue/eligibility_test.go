@@ -12,6 +12,7 @@ func baseCfg() *config.Config {
 		CUListID:      "list1",
 		TriggerTag:    "ai",
 		StatusTrigger: "to check",
+		StatusRunning: "checking",
 	}
 }
 
@@ -75,5 +76,70 @@ func TestSpecFileID_FallsBackToNativeIDWithoutCustomID(t *testing.T) {
 	task := &clickup.Task{ID: "869d9kt6a"}
 	if got := specFileID(task); got != "869d9kt6a" {
 		t.Errorf("specFileID = %q, want %q", got, "869d9kt6a")
+	}
+}
+
+func TestResumable_StillInTriggerStatusWithTag(t *testing.T) {
+	task := &clickup.Task{Tags: []string{"ai"}, Status: "to check"}
+	if !resumable(task, baseCfg()) {
+		t.Fatal("expected task still in STATUS_TRIGGER with the trigger tag to be resumable")
+	}
+}
+
+func TestResumable_StillInRunningStatusWithTag(t *testing.T) {
+	task := &clickup.Task{Tags: []string{"ai"}, Status: "checking"}
+	if !resumable(task, baseCfg()) {
+		t.Fatal("expected task still in STATUS_RUNNING with the trigger tag to be resumable")
+	}
+}
+
+func TestResumable_IgnoresList(t *testing.T) {
+	// В отличие от isEligible, resumable не проверяет список: прогон уже
+	// был начат для этой задачи, продолжается независимо от ListID.
+	task := &clickup.Task{Status: "checking", Tags: []string{"ai"}}
+	cfg := baseCfg()
+	cfg.CUListID = "completely-different-list"
+	if !resumable(task, cfg) {
+		t.Fatal("expected resumable to ignore list membership")
+	}
+}
+
+func TestResumable_TagRemoved(t *testing.T) {
+	task := &clickup.Task{Tags: []string{"other"}, Status: "checking"}
+	if resumable(task, baseCfg()) {
+		t.Fatal("expected task without the trigger tag to not be resumable — looks handled manually")
+	}
+}
+
+func TestResumable_StatusMovedElsewhere(t *testing.T) {
+	task := &clickup.Task{Tags: []string{"ai"}, Status: "rework"}
+	if resumable(task, baseCfg()) {
+		t.Fatal("expected task moved to an unrelated status to not be resumable — looks handled manually")
+	}
+}
+
+func TestStaleAssignees_ExcludesWantedIDs(t *testing.T) {
+	got := staleAssignees([]int{1, 2, 3}, []int{2})
+	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Errorf("expected [1 3], got %+v", got)
+	}
+}
+
+func TestStaleAssignees_NoneStaleWhenAllWanted(t *testing.T) {
+	if got := staleAssignees([]int{1, 2}, []int{1, 2}); len(got) != 0 {
+		t.Errorf("expected no stale assignees, got %+v", got)
+	}
+}
+
+func TestStaleAssignees_EmptyCurrentIsNoop(t *testing.T) {
+	if got := staleAssignees(nil, []int{1}); got != nil {
+		t.Errorf("expected nil for empty current assignees, got %+v", got)
+	}
+}
+
+func TestStaleAssignees_AllStaleWhenNothingWanted(t *testing.T) {
+	got := staleAssignees([]int{1, 2}, nil)
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Errorf("expected all current assignees to be stale, got %+v", got)
 	}
 }

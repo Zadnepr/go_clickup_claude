@@ -127,6 +127,31 @@ func (q *Queue) addPending(taskID string) {
 	q.pending = append(q.pending, taskID)
 }
 
+// alreadyQueuedOrActive проверяет, не лежит ли taskID уже в буфере или не
+// обрабатывается ли воркером прямо сейчас — вызывается перед постановкой в
+// очередь (см. Submit/SubmitWithOptions/SubmitResume). Без этой проверки
+// повторный Submit того же task_id (типичный случай — сверка раз за разом
+// находит одну и ту же ещё не взятую в обработку задачу, пока единственный
+// воркер занят другой проверкой) копит в буфере дубли одного и того же
+// task_id: они не портят корректность (ReopenOrEnqueue/TryEnqueue всё равно
+// схлопнут повторную обработку в no-op), но зря съедают слоты буфера и
+// засоряют "Очередь" в вебе повторами одной и той же задачи.
+func (q *Queue) alreadyQueuedOrActive(taskID string) bool {
+	q.pendingMu.Lock()
+	for _, id := range q.pending {
+		if id == taskID {
+			q.pendingMu.Unlock()
+			return true
+		}
+	}
+	q.pendingMu.Unlock()
+
+	q.activeMu.Lock()
+	_, active := q.active[taskID]
+	q.activeMu.Unlock()
+	return active
+}
+
 func (q *Queue) removePending(taskID string) {
 	q.pendingMu.Lock()
 	defer q.pendingMu.Unlock()
